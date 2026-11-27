@@ -1999,6 +1999,40 @@ def _pid_alive(pid):
     return True
 
 
+def _pid_gone(pid):
+    """True only when it is certain that no process has this id: the
+    system said there is none (_pid_alive also says False when it can't
+    tell). Round 6: a temporary file whose writer is gone is removed at
+    any age, so a doubt must keep it."""
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0 or pid == os.getpid():
+        return False
+    if IS_WINDOWS:
+        try:
+            k = ctypes.WinDLL("kernel32", use_last_error=True)
+            h = k.OpenProcess(0x1000, False, pid)   # QUERY_LIMITED_INFO
+            if not h:
+                return ctypes.get_last_error() == 87   # no such process
+            try:
+                code = ctypes.c_ulong()
+                ok = k.GetExitCodeProcess(h, ctypes.byref(code))
+            finally:
+                k.CloseHandle(h)
+            return bool(ok) and code.value != 259    # not STILL_ACTIVE
+        except (AttributeError, OSError):
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return True
+    except OSError:
+        return False
+    return False
+
+
 class BootReceipt:
     """One small JSON file per start: what ran, how long it took, what
     failed (with the exact error). Written after every step, so even a hard
@@ -3998,8 +4032,7 @@ class LoaderWindow(tk.Frame):
     def _copy_details(self):
         try:
             text = self.log.get("1.0", "end")
-            self.clipboard_clear()
-            self.clipboard_append(mask_sensitive(text))
+            put_on_clipboard(self, mask_sensitive(text))
             self.post_footer("Details copied (addresses masked).")
         except tk.TclError:
             pass
@@ -10244,8 +10277,8 @@ def _ipv6_upper(ipl):
 _LOGIN_FIELD = (rb"(?:password|passwd|passwort|kennwort|pass|pwd|pw|"
                 rb"user_?pass|login_?password|motdepasse|mot_de_passe|"
                 rb"contrase(?:%c3%b1|\xc3\xb1|n)a|senha)")
-_LOGIN_FORM_RX = re.compile(rb"(?:^|[&\s])" + _LOGIN_FIELD + rb"=[^&\s]",
-                            re.I)
+_LOGIN_FORM_RX = re.compile(rb"(?:^|[&\s])(" + _LOGIN_FIELD +
+                            rb")=[^&\s]", re.I)
 _LOGIN_JSON_RX = re.compile(rb"\"" + _LOGIN_FIELD + rb"\"\s*:\s*\"[^\"]",
                             re.I)
 _LOGIN_PART_RX = re.compile(rb"name=\"" + _LOGIN_FIELD + rb"\"", re.I)
@@ -10257,11 +10290,32 @@ _LOGIN_FORM_TYPES = (b"x-www-form-urlencoded", b"multipart/form-data",
                      b"application/json")
 
 
+# sixth audit: "pass=2&page=3" (a page or round number) was a login.
+# A field named only "pass" whose value is a number of 1 to 3 digits is
+# not taken for a password. "#" stands for such a digit while the rest of
+# the body is awaited (login_form_tail keeps no value, only its length)
+_LOGIN_COUNTER_RX = re.compile(rb"[0-9#]{1,3}(?:[&\s]|\Z)")
+_LOGIN_COUNTER_END_RX = re.compile(rb"(?:^|([&\s]))(pass)=([0-9#]{1,3})\Z",
+                                   re.I)
+
+
+def form_password_field(body):
+    """True when a form body (or a web address's query, after "&") has a
+    password field with a value. Not "pass" with a 1 to 3 digit number
+    (sixth audit: pass=2&page=3)."""
+    for m in _LOGIN_FORM_RX.finditer(body):
+        if m.group(1).lower() == b"pass" and \
+                _LOGIN_COUNTER_RX.match(body, m.end() - 1):
+            continue
+        return True
+    return False
+
+
 def http_form_login(body):
     """"a password field in a web form" when a request body carries a
     password field with a value, else ""."""
     body = body[:4096]
-    if _LOGIN_FORM_RX.search(body) or _LOGIN_JSON_RX.search(body) or \
+    if form_password_field(body) or _LOGIN_JSON_RX.search(body) or \
             _LOGIN_PART_RX.search(body):
         return "a password field in a web form"
     return ""
@@ -10290,7 +10344,14 @@ def login_form_tail(buf, whole=False):
     packet is awaited: only bytes that can still grow into the start of
     a password field ("&pass", 'name="pass', '"password": "'), never a
     value or another field. `whole`: buf starts at the body's start (a
-    field may start there without "&"). -> bytes, at most 64."""
+    field may start there without "&"). -> bytes, at most 64. Sixth
+    audit: "&pass=2" at the end may be a page number or a password's
+    first digits: it waits as "&pass=#", one "#" for each digit, so no
+    digit of it is kept."""
+    m = _LOGIN_COUNTER_END_RX.search(buf)
+    if m is not None and (m.group(1) or whole):
+        return (m.group(1) or b"") + m.group(2) + b"=" + \
+            b"#" * len(m.group(3))
     lo = buf.lower()
     for s in range(max(0, len(lo) - 64), len(lo)):
         c = lo[s:]
@@ -10317,12 +10378,16 @@ def _login_in_packet(d, load):
         how = ""
         if _LOGIN_BASIC_RX.search(head):
             how = "HTTP Basic sign-in"
-        elif _LOGIN_QUERY_RX.match(head.split(b"\n", 1)[0]):
+        elif _LOGIN_QUERY_RX.match(head.split(b"\n", 1)[0]) and \
+                form_password_field(b"&" + head.split(b"\n", 1)[0].split(
+                    b" ", 2)[1].split(b"?", 1)[-1]):
             how = "a password in the web address"
         elif head[:4] in (b"POST", b"PUT ", b"PATC"):
             cut = head.find(b"\r\n\r\n")
             cut, skip = (cut, 4) if cut >= 0 else (head.find(b"\n\n"), 2)
             if cut < 0:
+                # sixth audit: the headers go on in the next packet
+                d["form_head"] = True
                 return
             body = head[cut + skip:]
             how = http_form_login(body)
@@ -10342,12 +10407,20 @@ def _login_in_packet(d, load):
         d["login"], d["login_proto"] = "LOGIN command", "IMAP"
 
 
+# sixth audit: a request split inside its method ("PO" + "ST /login …",
+# or one byte a packet) was never looked at
+_FORM_METHODS = (b"POST ", b"PUT ", b"PATCH ")
+
+
 def _decode_tcp_payload(d, load, reasm):
     if FEATURES.get("login_warning", True) and (
             load[:5] in (b"PASS ", b"pass ") or load[:4] in (
                 b"GET ", b"POST", b"PUT ", b"PATC") or (
                 d.get("dport") == 143 and b" LOGIN " in load[:256].upper())):
         _login_in_packet(d, load)
+    elif 0 < len(load) < 6 and FEATURES.get("login_warning", True) and \
+            any(m.startswith(load) for m in _FORM_METHODS):
+        d["form_head"] = "prefix"
     # plain HTTP?
     if load[:4] in (b"GET ", b"POST", b"HEAD", b"PUT ", b"DELE",
                     b"OPTI", b"PATC", b"CONN") or load[:5] == b"HTTP/":
@@ -15455,11 +15528,15 @@ def dhcp_peers(devices):
 
 
 def classify_device(dev, gateway_ip="", my_ips=(), my_macs=(),
-                    ra_routers=(), gw_macs=(), peers=None):
+                    ra_routers=(), gw_macs=(), peers=None, dhcp_unsure=()):
     """Best guess at what a device is, with the reasons. Never certain:
     returns (class, confidence_word, reasons) where confidence_word is
     'Likely', 'Possibly' or ''. `peers` (from dhcp_peers) lets a device
-    that asks DHCP exactly like a known one share its kind (Possibly)."""
+    that asks DHCP exactly like a known one share its kind (Possibly).
+    `dhcp_unsure`: addresses of DHCP servers that name themselves as the
+    router while another one does too and nothing showed which is real
+    (NetworkModel.dhcp_unsure_routers): each is Possibly a router, never
+    your router."""
     if dev.ip and dev.ip in my_ips or (dev.mac and dev.mac in my_macs):
         return "This computer", "", ["This is the computer running "
                                      "MiniWireshark"]
@@ -15478,6 +15555,12 @@ def classify_device(dev, gateway_ip="", my_ips=(), my_macs=(),
         add("Router", 80, "It answered for your router's address")
     if dev.mac and dev.mac in ra_routers:
         add("Router", 70, "It announces itself as an IPv6 router")
+    if dev.ip and dev.ip in dhcp_unsure and dev.ip != gateway_ip:
+        # seventh audit: a file with two DHCP servers and nothing else
+        # left the real router with no label at all
+        add("Router", 40, "It hands out addresses (DHCP) and names itself "
+                          "as the router, but so does another device, so "
+                          "it is not confirmed as your router")
     if dev.is_virtual:
         add("Container/virtual interface", 80,
             "Its address is in a typical container/virtual-network range")
@@ -18587,7 +18670,8 @@ class AlertEngine:
                 return None
             f = self._rogue_fields(servers, rogue)
             return self._add("dhcp_anomaly", "DANGER", "", f[0], f[1], f[2],
-                             f[3], confidence="High", why=f[4],
+                             f[3], confidence="High" if rogue[5:6] != (
+                                 False,) else "Medium", why=f[4],
                              evidence=f[5], refs=f[6])
         if self._debounced("dhcp_anomaly", 300):
             return None
@@ -18605,8 +18689,31 @@ class AlertEngine:
     @staticmethod
     def _rogue_fields(servers, rogue):
         """(reason, observed, interpretation, explanations, why, evidence,
-        refs) of a second DHCP server handing out a different router."""
-        srv, router, dns, good, good_router = rogue
+        refs) of a second DHCP server handing out a different router.
+        Sixth audit: when nothing showed which one is real (rogue[5] is
+        False), neither is called the usual one."""
+        srv, router, dns, good, good_router = rogue[:5]
+        if rogue[5:6] == (False,):
+            return (
+                f"Two devices hand out addresses and different routers: "
+                f"{good} and {srv}",
+                f"{len(servers)} different DHCP servers seen: "
+                f"{', '.join(sorted(servers))}. {good} gives {good_router} "
+                f"as the router and {srv} gives {router}. Nothing in what "
+                f"was seen shows which router the Internet traffic really "
+                f"goes through, so neither is taken as your router.",
+                "One of them may be a device pretending to be your router: "
+                "devices that take an address from it send their Internet "
+                "traffic and name lookups through it.",
+                "A second router or a travel router plugged in by mistake "
+                "does the same. If you don't recognise that device, unplug "
+                "it and reconnect your devices.",
+                "Two DHCP servers named different routers, and nothing "
+                "showed which one is real.",
+                [f"DHCP server: {good}", f"Router it gives: {good_router}",
+                 f"DHCP server: {srv}", f"Router it gives: {router}"] +
+                ([f"DNS it gives: {', '.join(dns)}"] if dns else []),
+                {"remote": srv, "sure": False})
         selfish = [w for w, on in (("router", router == srv),
                                     ("DNS server", srv in dns)) if on]
         tail = (" It names itself as the " + " and the ".join(selfish)
@@ -18632,7 +18739,7 @@ class AlertEngine:
             [f"DHCP server: {srv}", f"Router it gives: {router}",
              f"Usual router: {good_router}"] +
             ([f"DNS it gives: {', '.join(dns)}"] if dns else []),
-            {"remote": srv})
+            {"remote": srv, "sure": True})
 
     def dhcp_impostor(self, imp):
         """Fourth audit: DHCP answers that carry one server address (your
@@ -19143,14 +19250,61 @@ class AlertEngine:
             refs={"most": n})
 
     # ---- second audit 2026-11-14 (#33, #35, #36) ---------------------------
-    def night_upload(self, dev, total, minutes, dest, service="", start=0.0):
+    def night_upload(self, dev, total, minutes, dest, service="", start=0.0,
+                     kind="backup"):
         """A device sent a lot to the Internet at night, more than twice
         what it ever sent in a night hour before. A known backup service
         (iCloud, Dropbox…) is said, and only an INFO: kept out of Unusual
-        activity, since phones and computers back up at night."""
+        activity, since phones and computers back up at night. Sixth
+        audit: so is a known call service (`kind` "call": Zoom, Teams…) or
+        video site ("video": YouTube, Vimeo) that the server's name came
+        from, and an upload by a device you marked as a NAS ("nas", no
+        service: its offsite backup). Seventh audit: a call or video
+        upload also needs the address in the provider's own ranges
+        (provider_owns_ip); "nas_guess" (a device only guessed to be a
+        NAS) is still a warning that says how to mark it."""
         if self._debounced(f"nightup:{dev.key}", 6 * 3600):
             return None
         size = _human_bytes(total)
+        name = dev.display_name()
+        if service and kind in ("call", "video"):
+            call = kind == "call"
+            return self._add(
+                "night_upload", "INFO", dev.key,
+                f"{name} was on a call at night ({service})" if call else
+                f"{name} uploaded a video at night ({service})",
+                f"At night it sent {size} to {dest} in {minutes} minutes. "
+                f"That is {service}, " +
+                ("a video and voice call service." if call else
+                 "a video site."),
+                "This looks like a video or voice call." if call else
+                "This looks like a video upload.",
+                "A call sends your picture and sound for as long as it "
+                "lasts." if call else
+                "Phones and computers often upload videos while they "
+                "charge at night.",
+                confidence="Medium",
+                why="Most of the data went to a known call service, looked "
+                    "up by name, at an address the service publishes as "
+                    "its own." if call else
+                    "Most of the data went to a known video site, looked "
+                    "up by name, at an address the site publishes as its "
+                    "own.",
+                evidence=[f"Sent: {size}", f"To: {dest}"],
+                refs={"explained": service, "start": start})
+        if not service and kind == "nas":
+            return self._add(
+                "night_upload", "INFO", dev.key,
+                f"{name} sent {size} at night (you marked it as a NAS)",
+                f"At night it sent {size} to {dest} in {minutes} minutes. "
+                f"You marked this device as a NAS.",
+                "This looks like a NAS copying its backup to the Internet.",
+                "A NAS often copies its backup to a cloud service at night. "
+                "It matters if you never set that up.",
+                confidence="Low",
+                why="You marked this device as a NAS.",
+                evidence=[f"Sent: {size}", f"To: {dest}"],
+                refs={"explained": "nas", "start": start})
         if service:
             return self._add(
                 "night_upload", "INFO", dev.key,
@@ -19169,6 +19323,14 @@ class AlertEngine:
             f"At night it sent {size} to {dest} in {minutes} minutes. It "
             f"has never sent this much in a night hour before.",
             "Data left this device while it is usually idle.",
+            # seventh audit: a device only guessed to be a NAS still warns
+            # on its first offsite backup; it is told how to stop that
+            "It looks like a NAS, and a NAS often copies its backup to a "
+            "cloud service at night. If this is your NAS and you set that "
+            "up, right-click it in Devices, choose Set device type… and "
+            "pick NAS: a later night backup is then only an INFO, out of "
+            "Unusual activity."
+            if kind == "nas_guess" else
             "Backups, photo syncs and system updates run at night too. It "
             "matters if nothing on the device should be sending files.",
             confidence="Medium",
@@ -22197,9 +22359,10 @@ def device_scales_key():
         for n, w in CONFIDENCE_STEPS)
     lv = " · ".join(f"{LEVEL_GLYPH[x]} {LEVEL_WORD[x]}" for x in (
         LV_OBSERVED, LV_REPORTED, LV_CORRELATED, LV_INFERRED, LV_UNKNOWN))
-    return (f"Device evidence: is it a real device? {conf}. Evidence: how "
-            f"three facts are known, in order: on your network · name · "
-            f"kind ({lv}). “Likely” or “Possibly” before a kind is how sure "
+    return (f"Device evidence: is it a real device? {conf}. The Evidence "
+            f"column is off unless you turn it on (right-click a heading → "
+            f"Columns); it shows how three facts are known, in order: on "
+            f"your network · name · kind ({lv}). “Likely” or “Possibly” before a kind is how sure "
             f"that guess is, so a device with High evidence can still be "
             f"only “Possibly” a printer.")
 
@@ -24275,7 +24438,116 @@ KNOWN_BULK_SERVICES = (
     ("dssott.com", "Disney+", "stream"),
     ("aiv-cdn.net", "Prime Video", "stream"),
     ("scdn.co", "Spotify", "stream"),
+    # sixth audit: a call (Zoom at 23:10) or a video upload (YouTube at
+    # 03:00) sends a lot at night too. Said as one only when the server's
+    # name came from a DNS answer (NetworkModel.dns_names)
+    ("zoom.us", "Zoom", "call"),
+    ("zoom.com", "Zoom", "call"),
+    ("zoomgov.com", "Zoom", "call"),
+    ("teams.microsoft.com", "Microsoft Teams", "call"),
+    ("skype.com", "Skype", "call"),
+    ("webex.com", "Webex", "call"),
+    ("meet.google.com", "Google Meet", "call"),
+    ("discord.media", "Discord", "call"),
+    ("whatsapp.net", "WhatsApp", "call"),
+    ("youtube.com", "YouTube", "video"),
+    ("vimeo.com", "Vimeo", "video"),
 )
+# the kinds a night upload may be said as (kind=None in known_bulk_service
+# still finds a stream first: youtube.com is in both)
+NIGHT_UPLOAD_KINDS = ("backup", "call", "video")
+# Seventh audit: a forged DNS answer naming zoom.us made a 30 MB upload at
+# night to an attacker's address an INFO, kept out of Unusual activity. A
+# call or video upload is said as one only when the address is also in
+# the provider's own address ranges below. Where they come from (each
+# provider's published list; written down for 5.3.4 without downloading
+# them again, so a range a provider added later is missing; MiniWireshark
+# never downloads them):
+#   Zoom: "Zoom network firewall or proxy server settings" (Zoom support;
+#     assets.zoom.us/docs/ipranges/Zoom.txt), the ranges Zoom owns only,
+#     not its rented cloud space (AWS, Oracle)
+#   Microsoft Teams, Skype: "Microsoft 365 URLs and IP address ranges"
+#     (endpoints.office.com), the Teams media and signalling rows
+#   Webex: "Network Requirements for Webex Services" (help.webex.com),
+#     the Cisco-owned subnets, not the Azure or AWS ones
+#   Google Meet, YouTube: Google's own ranges (www.gstatic.com/ipranges/
+#     goog.json), only the ones Google's own services answer on, never
+#     Google Cloud's (cloud.json), which anyone can rent
+#   WhatsApp: Meta's network (AS32934) as Meta registers it in the routing
+#     registries (whois -h whois.radb.net -- '-i origin AS32934'), which
+#     Meta's developer pages point to
+#   Discord and Vimeo publish no list of their own (they run on shared
+#     clouds anyone can rent), so a night upload to them warns as it did
+#     before 5.3.4.
+# A provider's new range missing here makes a real call warn again (the
+# old behaviour); it never hides an upload.
+NIGHT_PROVIDER_NETS = {
+    "Zoom": (
+        "8.5.128.0/23", "69.174.57.0/24", "69.174.108.0/22",
+        "103.122.166.0/23", "134.224.0.0/16", "144.195.0.0/16",
+        "147.124.96.0/19", "149.137.0.0/17", "156.45.0.0/17",
+        "159.124.0.0/16", "162.12.232.0/22", "162.255.36.0/22",
+        "170.114.0.0/16", "173.231.80.0/20", "192.204.12.0/22",
+        "198.251.128.0/17", "204.80.104.0/21", "204.141.28.0/22",
+        "206.247.0.0/16", "207.226.132.0/24", "209.9.211.0/24",
+        "209.9.215.0/24", "213.19.144.0/24", "213.244.140.0/24",
+        "2620:123:2000::/40"),
+    "Microsoft Teams": (
+        "13.107.64.0/18", "52.112.0.0/14", "52.122.0.0/15",
+        "2603:1027::/48", "2603:1037::/48", "2603:1047::/48",
+        "2603:1057::/48", "2603:1063::/38", "2620:1ec:6::/48",
+        "2620:1ec:40::/42"),
+    "Webex": (
+        "23.89.0.0/16", "62.109.192.0/18", "64.68.96.0/19",
+        "66.114.160.0/20", "66.163.32.0/19", "69.26.160.0/19",
+        "114.29.192.0/19", "144.196.0.0/16", "150.253.128.0/17",
+        "163.129.0.0/16", "170.72.0.0/16", "170.133.128.0/18",
+        "173.39.224.0/19", "173.243.0.0/20", "207.182.160.0/19",
+        "209.197.192.0/19", "210.4.192.0/20", "216.151.128.0/19"),
+    "Google": (
+        "64.233.160.0/19", "66.102.0.0/20", "66.249.64.0/19",
+        "72.14.192.0/18", "74.125.0.0/16", "108.177.0.0/17",
+        "142.250.0.0/15", "172.217.0.0/16", "172.253.0.0/16",
+        "173.194.0.0/16", "192.178.0.0/15", "208.65.152.0/22",
+        "208.117.224.0/19", "209.85.128.0/17", "216.58.192.0/19",
+        "216.239.32.0/19", "2001:4860::/32", "2404:6800::/32",
+        "2607:f8b0::/32", "2800:3f0::/32", "2a00:1450::/32",
+        "2c0f:fb50::/32"),
+    "WhatsApp": (
+        "31.13.24.0/21", "31.13.64.0/18", "45.64.40.0/22",
+        "57.144.0.0/14", "66.220.144.0/20", "69.63.176.0/20",
+        "69.171.224.0/19", "74.119.76.0/22", "102.132.96.0/20",
+        "103.4.96.0/22", "129.134.0.0/16", "157.240.0.0/16",
+        "163.70.128.0/17", "173.252.64.0/18", "179.60.192.0/22",
+        "185.60.216.0/22", "185.89.216.0/22", "204.15.20.0/22",
+        "2a03:2880::/29"),
+}
+NIGHT_PROVIDER_OF = {"Zoom": "Zoom", "Microsoft Teams": "Microsoft Teams",
+                     "Skype": "Microsoft Teams", "Webex": "Webex",
+                     "Google Meet": "Google", "YouTube": "Google",
+                     "WhatsApp": "WhatsApp"}
+_NIGHT_NETS = {}
+
+
+def provider_owns_ip(label, ip):
+    """Seventh audit: True when `ip` is in the published address ranges of
+    the call service or video site `label` (NIGHT_PROVIDER_NETS). False
+    for any other address, a bad one, or a service with no published list
+    (Discord, Vimeo)."""
+    nets = _NIGHT_NETS.get(label)
+    if nets is None:
+        nets = _NIGHT_NETS[label] = tuple(
+            ipaddress.ip_network(n) for n in NIGHT_PROVIDER_NETS.get(
+                NIGHT_PROVIDER_OF.get(label, ""), ()))
+    if not nets:
+        return False
+    try:
+        addr = ipaddress.ip_address(str(ip or "").split("%", 1)[0])
+    except ValueError:
+        return False
+    if getattr(addr, "ipv4_mapped", None):
+        addr = addr.ipv4_mapped
+    return any(addr.version == n.version and addr in n for n in nets)
 NIGHT_UPLOAD_BYTES = 20 * 1024 * 1024   # sent in one night hour
 NIGHT_UPLOAD_WINDOW = 3600.0
 BEACON_MIN_CONTACTS = 30
@@ -24503,6 +24775,10 @@ class NetworkModel:
         # SNI, HTTP Host), never from a DNS answer: anyone can write
         # "icloud-content.com" there
         self.ip_unconfirmed = {}
+        # sixth audit: a request whose method or headers go on in the
+        # next packet: key4 -> (time, method so far or None, the end that
+        # may still become a header end or a form type, form seen, bytes)
+        self._head_wait = OrderedDict()
         self._form_wait = OrderedDict()  # (#34) a form POST's body next
         self._dup_pending = OrderedDict()  # (#39) address → (ts, MAC)
         # (ts, rtt, remote, dev, fid)
@@ -25397,8 +25673,9 @@ class NetworkModel:
         self._observe_remote(d, ts, direction, src_dev, dst_dev, new_flow)
         if d["cleartext"]:
             self._observe_cleartext(d, src_dev, dst_dev, direction)
-        if d.get("login") or d.get("form_post") or (
-                self._form_wait and d.get("payload_len")):
+        if d.get("login") or d.get("form_post") or d.get("form_head") or (
+                (self._form_wait or self._head_wait) and
+                d.get("payload_len")):
             self._observe_login(d)
         self._baseline_observe(d, ts, src_dev, dst_dev, direction, flow,
                                new_flow)
@@ -25683,6 +25960,11 @@ class NetworkModel:
                 if len(self.dhcp_servers) > 1:
                     self._alert(self.alerts.dhcp_anomaly(
                         set(self.dhcp_servers), self.dhcp_rogue()))
+                    # seventh audit: their kinds depend on each other now
+                    for s in self.dhcp_servers:
+                        k = self.registry.ip_to_key.get(s)
+                        if k:
+                            self._classify_dirty.add(k)
                 if imp is not None:
                     self._alert(self.alerts.dhcp_impostor(imp))
             if info.get("router"):
@@ -26262,12 +26544,20 @@ class NetworkModel:
                 if un is None and len(self.ip_unconfirmed) < \
                         self.IP_NAMES_KEEP:
                     un = self.ip_unconfirmed[ip] = set()
-                if un is not None and len(un) < 8:
+                if un is not None:
                     un.add(key)
             names.pop(key, None)
             names[key] = ts
             while len(names) > 8:
                 del names[next(iter(names))]
+            if un:
+                # seventh audit: `un` stopped at 8 names, so a ninth name
+                # from TLS hellos (p42-content.icloud-content.com after
+                # eight others) counted as one from a DNS answer. It holds
+                # only the address's names now, at most 8
+                un.intersection_update(names)
+                if not un:
+                    self.ip_unconfirmed.pop(ip, None)
             rh = self.remote_hosts.get(ip)
             if rh is not None:
                 if len(rh.domains) < 20:
@@ -26487,21 +26777,25 @@ class NetworkModel:
         key4 = (d["src_ip"], d["sport"], d["dst_ip"], d["dport"])
         how, proto = d.get("login") or "", d.get("login_proto") or "HTTP"
         fw = self._form_wait   # OrderedDict, oldest first: forget after 30 s
-        while fw and d["time"] - next(iter(fw.values()))[0] > 30:
-            fw.popitem(last=False)
-        if not how:
+        hw = self._head_wait
+        for od in (fw, hw):
+            while od and d["time"] - next(iter(od.values()))[0] > 30:
+                od.popitem(last=False)
+        fh = d.get("form_head")
+        if fh == "prefix" and key4 in fw:
+            fh = False                 # a body's next bytes ("P", "PU"…)
+        if d.get("form_post") or how:
+            hw.pop(key4, None)         # a request whose headers are whole
+        if not how and (fh or key4 in hw):
+            how = self._form_head(d, key4, fh)
+        elif not how:
             post = d.get("form_post")
             if not post and key4 not in fw:
                 return None
             # a new POST drops the old body
             _t, tail, seen = fw.pop(key4, (0, b"", 0))
             tail, seen = (b"", 0) if post else (tail, seen)
-            n = d.get("payload_len") or 0
-            raw = d.get("raw") or b""
-            if not raw and d.get("pkt") is not None:
-                with contextlib.suppress(Exception):
-                    raw = bytes(d["pkt"])          # scapy's decoder
-            load = bytes(raw[-n:][:4096]) if n else b""
+            load = self._login_load(d)
             if post:                               # the body after headers
                 cut = load.find(b"\r\n\r\n")
                 load = load[cut + 4:] if cut >= 0 else \
@@ -26509,23 +26803,107 @@ class NetworkModel:
             elif load[:4] in (b"GET ", b"POST", b"HEAD", b"PUT ", b"DELE",
                               b"OPTI", b"PATC"):
                 return None                        # the next request
-            load = load[:max(0, 4096 - seen)]  # the body's first 4096 bytes
-            whole = len(tail) == seen          # tail is the body so far
-            buf = tail + load
-            # not at the body's start: a field can't start at byte 0 (the
-            # byte before it was a value's), so "^" must not match there
-            how = http_form_login(buf if whole else b"\0" + buf)
-            if not how:
-                seen += len(load)
-                if seen < 4096:
-                    # fifth audit: only what may still become a password
-                    # field's start is kept, never the body itself
-                    self._bounded_put(self._form_wait, key4, (
-                        d["time"], login_form_tail(buf, whole), seen), 256)
-                return None
+            how = self._form_body(d, key4, tail, seen, load)
+        if not how:
+            return None
         return self.deep_login({"client": d["src_ip"],
                                 "server": d["dst_ip"], "port": d["dport"],
                                 "proto": proto, "how": how}, packet=True)
+
+    @staticmethod
+    def _login_load(d):
+        """The first 4096 bytes of a packet's TCP payload (read here,
+        never kept)."""
+        n = d.get("payload_len") or 0
+        raw = d.get("raw") or b""
+        if not raw and d.get("pkt") is not None:
+            with contextlib.suppress(Exception):
+                raw = bytes(d["pkt"])              # scapy's decoder
+        return bytes(raw[-n:][:4096]) if n else b""
+
+    def _form_body(self, d, key4, tail, seen, load):
+        """A form body's next bytes `load`, after `tail` (what waited) and
+        `seen` bytes of it → how a password went by, or "" (then only the
+        end that may still become a password field's start waits)."""
+        load = load[:max(0, 4096 - seen)]  # the body's first 4096 bytes
+        whole = len(tail) == seen          # tail is the body so far
+        buf = tail + load
+        # not at the body's start: a field can't start at byte 0 (the
+        # byte before it was a value's), so "^" must not match there
+        how = http_form_login(buf if whole else b"\0" + buf)
+        if not how:
+            seen += len(load)
+            if seen < 4096:
+                # fifth audit: only what may still become a password
+                # field's start is kept, never the body itself
+                self._bounded_put(self._form_wait, key4, (
+                    d["time"], login_form_tail(buf, whole), seen), 256)
+        return how
+
+    _HEAD_MARKS = (b"\r\n\r\n", b"\n\n") + _LOGIN_FORM_TYPES
+
+    def _form_head(self, d, key4, fh):
+        """Sixth audit: a POST split inside its method ("PO" + "ST …", one
+        byte a packet) or whose headers go on in the next packet was never
+        looked at. What waits (30 s at most, 256 requests) is the method
+        so far while it is shorter than "PATCH ", then only the end that
+        may still become the headers' end or a form type ("\r\n",
+        "multipart/fo"), whether a form type was seen and how many header
+        bytes went by: never a header's value. → how a password went by,
+        or ""."""
+        hw = self._head_wait
+        load = self._login_load(d)
+        st = hw.pop(key4, None)
+        if st is None or load[:4] in (b"GET ", b"POST", b"HEAD", b"PUT ",
+                                      b"DELE", b"OPTI", b"PATC"):
+            if not fh:
+                return ""                          # another request
+            self._form_wait.pop(key4, None)        # a new request
+            st = (0, b"", b"", False, 0)
+        _t, start, tail, form, n = st
+        if start is not None:                      # the method so far
+            buf = start + load
+            if not buf.startswith(_FORM_METHODS):
+                if len(buf) < 6 and any(m.startswith(buf)
+                                        for m in _FORM_METHODS):
+                    self._bounded_put(hw, key4, (d["time"], buf, b"",
+                                                 False, 0), 256)
+                return ""
+            if start:
+                # the method was split: the request so far, read at once
+                t = {"dport": d.get("dport")}
+                _login_in_packet(t, buf[:4096])
+                if t.get("login"):
+                    return t["login"]
+                if not t.get("form_head"):
+                    if not t.get("form_post"):
+                        return ""
+                    cut = buf.find(b"\r\n\r\n")
+                    body = buf[cut + 4:] if cut >= 0 else \
+                        buf[buf.find(b"\n\n") + 2:]
+                    return self._form_body(d, key4, b"", 0, body)
+            load = buf
+        low = (tail + load[:4096]).lower()
+        form = form or any(t in low for t in _LOGIN_FORM_TYPES)
+        cut = low.find(b"\r\n\r\n")
+        cut, skip = (cut, 4) if cut >= 0 else (low.find(b"\n\n"), 2)
+        if cut >= 0:
+            body = (tail + load)[cut + skip:]
+            if not form:
+                # not a web form: this packet's body only, as when the
+                # whole request comes in one packet (_login_in_packet)
+                return http_form_login(body[:4096])
+            return self._form_body(d, key4, b"", 0, body)
+        n += len(load)
+        if n < 4096:
+            keep = b""
+            for i in range(max(0, len(low) - 24), len(low)):
+                if any(m.startswith(low[i:]) for m in self._HEAD_MARKS):
+                    keep = low[i:]
+                    break
+            self._bounded_put(hw, key4, (d["time"], None, keep, form, n),
+                              256)
+        return ""
 
     def deep_login(self, t, packet=False):
         """5.3.4 (IP-013): a login the deep pass saw sent without
@@ -26651,12 +27029,24 @@ class NetworkModel:
         ep["told"] = True
         sent = sum(ep["to"].values()) or 1
         backup = 0
-        service = ""
+        service, skind = "", "backup"
         for ip, n in ep["to"].most_common():
-            hit = known_bulk_service(self.dns_names(ip), "backup")
+            names = self.dns_names(ip)
+            hit = None
+            for k in NIGHT_UPLOAD_KINDS:
+                hit = known_bulk_service(names, k)
+                # seventh audit: a forged DNS answer can give any address
+                # Zoom's name; a call or video upload also needs the
+                # address in the provider's own ranges
+                if hit and k in ("call", "video") and \
+                        not provider_owns_ip(hit[0], ip):
+                    hit = None
+                if hit:
+                    break
             if hit:
                 backup += n
-                service = service or hit[0]
+                if not service:
+                    service, skind = hit
         top = ep["to"].most_common(1)
         top_ip = top[0][0] if top else ""
         names = self.ip_to_domains.get(top_ip)
@@ -26665,10 +27055,19 @@ class NetworkModel:
             dest += f" and {len(ep['to']) - 1} other servers" \
                 if len(ep["to"]) > 2 else " and 1 other server"
         minutes = mins[-1][0] - mins[0][0] + 1
+        if backup < 0.7 * sent:
+            service, skind = "", "backup"
+            # sixth audit: a NAS's first offsite backup was a warning. Only
+            # a device YOU marked as a NAS (a guessed kind can be wrong)
+            if dev.user_class == "NAS":
+                skind = "nas"
+            elif not dev.user_class and dev.device_class == "NAS":
+                # seventh audit: still a warning (the guess rests on what
+                # the device says of itself), but it says how to mark it
+                skind = "nas_guess"
         return self._alert(self.alerts.night_upload(
-            dev, total, minutes, dest,
-            service if backup >= 0.7 * sent else "",
-            start=mins[0][0] * 60.0))
+            dev, total, minutes, dest, service, start=mins[0][0] * 60.0,
+            kind=skind))
 
     def _check_beacon(self, fk, starts, n, flow):
         """(#35) A device that opens a new connection to one server on a
@@ -26990,29 +27389,59 @@ class NetworkModel:
         the sum: 1,000 devices meeting new websites filled 500 of each a
         device (a million texts, about 125 MB), and the harsh looped replay
         grew in a straight line until they had. Past DEVICE_SITES_TOTAL (or
-        DEVICE_REMOTES_TOTAL) in all, the devices seen longest ago let go of
-        that list first, your labelled ones last, until a tenth is free.
-        -> the keys of the devices whose list was emptied."""
+        DEVICE_REMOTES_TOTAL) in all, entries go until a tenth is free.
+        Round 6: entry by entry (a quiet device lost its WHOLE list
+        before): the devices seen longest ago give their oldest entries
+        first, your labelled devices last, and each keeps its newest few
+        until every device is down to them. An entry's age is when that
+        device last met the website (its tie), else when the website or
+        remote host was last seen, never later than the device itself;
+        one whose record is already forgotten is oldest. Only the devices
+        that give are sorted, so it stays cheap in the tick.
+        -> the keys of the devices whose lists were shortened."""
         devs = self.registry.by_key.values()
-        gone = []
+        gone = {}
         for attr, cap in (("websites", self.DEVICE_SITES_TOTAL),
                           ("remote_ips", self.DEVICE_REMOTES_TOTAL)):
             total = sum(len(getattr(d, attr)) for d in devs)
             if total <= cap:
                 continue
-            goal = cap - cap // 10
+            drop = total - (cap - cap // 10)
             labelled = self.registry.labelled
-            for d in sorted(devs, key=lambda d: (labelled(d), d.last_seen)):
-                lst = getattr(d, attr)
-                if not lst:
-                    continue
-                total -= len(lst)
-                lst.clear()
-                self.dirty_devices.add(d.key)
-                gone.append(d.key)
-                if total <= goal:
+            order = sorted((d for d in devs if getattr(d, attr)),
+                           key=lambda d: (labelled(d), d.last_seen))
+            # the newest `floor` of every device together are at most half
+            # of what is kept, so the second round (to none) is for a
+            # network of tens of thousands of devices only
+            floor = max(1, (cap - cap // 10) // (2 * len(order)))
+            recs = self.websites if attr == "websites" else \
+                self.remote_hosts
+            for keep in (floor, 0):
+                for d in order:
+                    lst = getattr(d, attr)
+                    n = min(len(lst) - keep, drop)
+                    if n <= 0:
+                        continue
+                    seen, key = d.last_seen, d.key
+
+                    def age(e, seen=seen, key=key):
+                        r = recs.get(e)
+                        if r is None:
+                            return 0.0
+                        tie = r.ties.get(key) if attr == "websites" \
+                            else None
+                        return min(tie[2] if tie else r.last_seen, seen)
+                    timed = sorted(lst)        # the same order every time
+                    timed.sort(key=age)
+                    lst.difference_update(timed[:n])
+                    gone[key] = True
+                    drop -= n
+                    if drop <= 0:
+                        break
+                if drop <= 0:
                     break
-        return gone
+        self.dirty_devices.update(gone)
+        return list(gone)
 
     REMOTE_KEEP = 6 * 3600   # audit #4: remote hosts and their names
     REMOTE_MAX = 8000        # was 30,000, far above a home network's day
@@ -27174,13 +27603,15 @@ class NetworkModel:
         # known kind on this network (option 55, used at last)
         peers = dhcp_peers(self.registry.by_key.values()) \
             if keys and FEATURES.get("signatures_v2", True) else None
+        unsure = self.dhcp_unsure_routers() if keys else ()
         for key in keys:
             dev = self.registry.by_key.get(key)
             if dev is None:
                 continue
             cls, word, reasons = classify_device(
                 dev, self.gateway_ip, self.my_ips, self.my_macs,
-                self.registry.ra_routers, self.registry.gw_macs, peers)
+                self.registry.ra_routers, self.registry.gw_macs, peers,
+                unsure)
             if dev.user_class:
                 auto = f"{word} {cls}".strip()
                 reasons = ["You set this type"] + (
@@ -27238,6 +27669,13 @@ class NetworkModel:
         default route decides even when the rogue was heard first (and with
         the packet clock); only a gateway guessed from a file's DHCP isn't
         ground truth."""
+        t = self._dhcp_trust()
+        return t[:2] if t is not None else None
+
+    def _dhcp_trust(self):
+        """(server, router, sure) for dhcp_trusted(); sure is False when
+        neither the default route nor the Internet traffic decided (the
+        first one heard was taken)."""
         offers = [(s, o) for s, o in self.dhcp_offers.items()
                   if o.get("router")]
         if not offers:
@@ -27245,7 +27683,7 @@ class NetworkModel:
         if self.gateway_ip and not self.gateway_guessed:
             for s, o in offers:
                 if o["router"] == self.gateway_ip:
-                    return s, o["router"]
+                    return s, o["router"], True
         # fifth audit: a capture file has no default route; the router
         # the Internet traffic really goes through decides (the rogue
         # heard first was trusted, and the real router accused)
@@ -27258,8 +27696,8 @@ class NetworkModel:
             if n and (best is None or n > best[0]):
                 best = (n, s, o["router"])
         if best is not None:
-            return best[1], best[2]
-        return offers[0][0], offers[0][1]["router"]
+            return best[1], best[2], True
+        return offers[0][0], offers[0][1]["router"], False
 
     def _note_dhcp_mac(self, server, mac, info):
         """Fourth audit: what each MAC answering as DHCP server `server`
@@ -27338,7 +27776,9 @@ class NetworkModel:
         rogue = self.dhcp_rogue()
         a = eng.alerts.get(eng._open.get(("dhcp_anomaly", ""), ""))
         if a is not None and rogue is not None and not a.acknowledged and \
-                a.severity == "DANGER" and a.refs.get("remote") != rogue[0]:
+                a.severity == "DANGER" and \
+                (a.refs.get("remote"), a.refs.get("sure", True)) != \
+                (rogue[0], rogue[5]):
             eng.rewrite(a, eng._rogue_fields(set(self.dhcp_servers), rogue))
         for s in list(self.dhcp_twins):
             imp = self.dhcp_impostor(s)
@@ -27355,17 +27795,44 @@ class NetworkModel:
 
     def dhcp_rogue(self):
         """Second audit (#37): (server, router, DNS servers, trusted server,
-        trusted router) of a second DHCP server that hands out a different
-        router than the trusted one, else None."""
-        trusted = self.dhcp_trusted()
+        trusted router, sure) of a second DHCP server that hands out a
+        different router than the trusted one, else None. Sixth audit:
+        `sure` is False when nothing showed which one is real (a file with
+        only DHCP in it): then neither is called the usual one."""
+        trusted = self._dhcp_trust()
         if trusted is None:
             return None
         for s, o in self.dhcp_offers.items():
             if s != trusted[0] and o.get("router") and \
                     o["router"] != trusted[1]:
                 return s, o["router"], list(o.get("dns") or []), \
-                    trusted[0], trusted[1]
+                    trusted[0], trusted[1], trusted[2]
         return None
+
+    def dhcp_unsure_routers(self):
+        """Seventh audit: the DHCP servers that name themselves as the
+        router while two servers hand out different routers and nothing
+        shows which one is real (the case where neither becomes the
+        gateway). Each is labelled Possibly a router, not confirmed as
+        yours, so a file with only DHCP in it keeps the router's label
+        without picking one. Empty otherwise."""
+        rogue = self.dhcp_rogue()
+        if rogue is None or rogue[5]:
+            return frozenset()
+        return frozenset(s for s, o in self.dhcp_offers.items()
+                         if o.get("router") == s)
+
+    def drop_unsure_gateway(self):
+        """Sixth audit: reading a file, a router guessed earlier (the rogue
+        DHCP server's, heard first in a file with only DHCP in it) is
+        dropped once two DHCP servers hand out different routers and
+        nothing shows which one is real. → True when it was dropped."""
+        rogue = self.dhcp_rogue()
+        if self.gateway_guessed and self.gateway_ip and \
+                rogue is not None and not rogue[5]:
+            self.set_identity(gateway_ip="")
+            return True
+        return False
 
     def infer_gateway(self):
         """For imported captures: work out which address is the router,
@@ -27377,8 +27844,10 @@ class NetworkModel:
         now (refresh_dhcp_alerts), and a rogue answering with your
         router's address never makes its router the gateway."""
         self.refresh_dhcp_alerts()
-        if self.dhcp_rogue() is not None:
-            return self.dhcp_trusted()[1]
+        rogue = self.dhcp_rogue()
+        if rogue is not None:
+            # sixth audit: nothing tells which router is real: none of them
+            return rogue[4] if rogue[5] else ""
         imp = self.dhcp_impostor()
         if imp is not None and imp["real_router"]:
             return imp["real_router"]
@@ -27829,6 +28298,12 @@ def clean_config_values(data):
     return fixed
 
 
+SETTINGS_IS_FOLDER = ("Your settings can't be read: there is a folder where "
+                      "the settings file should be. This run uses the "
+                      "defaults and leaves the folder as it is; move or "
+                      "rename that folder so your settings can be saved.")
+
+
 class AppConfig:
     """JSON-backed settings. Degrades to defaults on any read/parse problem
     rather than crashing (keeping a backup of the damaged file); migrates
@@ -27901,6 +28376,14 @@ class AppConfig:
         # or indexer holding it on Windows) is retried, then left alone:
         # before, it counted as damaged and the next save replaced the
         # user's settings with the defaults
+        if os.path.isdir(self.path):
+            # round 8 (keyboard check on Windows): a folder with the
+            # settings file's name was reported as a file another program
+            # held, after a second of retries that could never work
+            LOG.warning("settings: %s is a folder, not a file", self.path)
+            self.read_only = True
+            self.warning = SETTINGS_IS_FOLDER
+            return defaults
         raw = None
         for attempt in range(4):
             try:
@@ -28072,6 +28555,94 @@ def config_defaults_flat():
             for k in vals:
                 out[f"{sec}.{k}"] = vals[k]
     return out
+
+
+def _rule_names_one(tag):
+    """An alert rule "kind|subject" made for one device, address or name,
+    not a whole alert type ("kind|*")."""
+    return str(tag).partition("|")[2].strip() not in ("", "*")
+
+
+def forget_seen_in_settings(data):
+    """Seventh audit (privacy): "Delete ALL history" left the settings
+    that name what was seen: the recent filters (ip.addr==192.168.1.77,
+    dns.qry.name==www.example.com), the alerts marked expected, muted or
+    snoozed for one device or address, the devices' places on the Map,
+    the website categories you chose and the row a saved workspace
+    selects. They are emptied in `data` (a settings dict, changed in
+    place); what you named yourself (filter presets, workspaces and their
+    filters, connectors) and the rules for a whole alert type are kept.
+    -> the dotted names that were changed."""
+    changed = []
+
+    def section(name):
+        sec = data.get(name) if isinstance(data, dict) else None
+        return sec if isinstance(sec, dict) else None
+
+    def empty(name, key, blank):
+        sec = section(name)
+        if sec is not None and sec.get(key):
+            sec[key] = blank
+            changed.append(f"{name}.{key}")
+
+    empty("filters", "recent", [])
+    empty("map", "positions", {})
+    empty("websites", "category_overrides", {})
+    alerts = section("alerts")
+    if alerts is not None:
+        for key in ("expected", "muted_devices"):
+            val = alerts.get(key)
+            keep = [t for t in val if not _rule_names_one(t)] \
+                if isinstance(val, list) else []
+            if val and keep != val:
+                alerts[key] = keep
+                changed.append(f"alerts.{key}")
+        val = alerts.get("snoozed")
+        keep = {k: v for k, v in val.items() if not _rule_names_one(k)} \
+            if isinstance(val, dict) else {}
+        if val and keep != val:
+            alerts["snoozed"] = keep
+            changed.append("alerts.snoozed")
+    ws = section("workspaces")
+    saved = ws.get("saved") if ws is not None else None
+    for one in (saved.values() if isinstance(saved, dict) else ()):
+        view = one.get("view") if isinstance(one, dict) else None
+        if isinstance(view, dict) and view.get("sel") is not None:
+            view["sel"] = None
+            if "workspaces.saved" not in changed:
+                changed.append("workspaces.saved")
+    return changed
+
+
+def forget_seen_settings(cfg):
+    """Seventh audit (privacy): forget_seen_in_settings on the settings
+    in use, saved at once (so closing the window writes them as they are
+    now), and on the day-old backup copy next to the file (one that can't
+    be read is deleted). -> the dotted names that were changed."""
+    changed = forget_seen_in_settings(cfg.data)
+    CATEGORY_OVERRIDES.clear()
+    if getattr(cfg, "read_only", False):
+        LOG.info("delete all history: the settings file is kept as it was")
+        return changed
+    if changed:
+        cfg.save()
+    bak = cfg.path + ".bak"
+    try:
+        if os.path.islink(bak) or not os.path.isfile(bak):
+            data = None
+        else:
+            with open(bak, "rb") as f:
+                data = json.loads(f.read().decode("utf-8-sig"))
+        if os.path.lexists(bak) and not isinstance(data, dict):
+            os.remove(bak)
+        elif data is not None and forget_seen_in_settings(data):
+            atomic_write_text(bak, json.dumps(data, indent=2, default=str))
+    except (OSError, ValueError):
+        with contextlib.suppress(OSError):
+            os.remove(bak)
+    LOG.info("delete all history: settings emptied: %s",
+             ", ".join(changed) or "none")
+    return changed
 
 
 # ---- V5: teach-once device fingerprints ---------------------------------------
@@ -28681,12 +29252,15 @@ class Store:
                 # day, so switching back and forth with 3.0.0 doesn't copy
                 # the whole file on every start
                 try:
-                    dst = sqlite3.connect(bak + ".tmp")
+                    # round 6: the writer's process id in the name, so a
+                    # copy cut short is swept (sweep_stale_temp_files)
+                    tmp = _tmp_name(bak)
+                    dst = sqlite3.connect(tmp)
                     try:
                         con.backup(dst)
                     finally:
                         dst.close()
-                    os.replace(bak + ".tmp", bak)
+                    os.replace(tmp, bak)
                 except (sqlite3.Error, OSError) as e:
                     LOG.warning("history backup before migrating: %s", e)
         for v in range(ver + 1, STORE_SCHEMA_VERSION + 1):
@@ -28762,10 +29336,13 @@ class Store:
         if age < 20 * 3600:
             return
         try:
-            dst = sqlite3.connect(bak + ".tmp")
-            con.backup(dst)
-            dst.close()
-            os.replace(bak + ".tmp", bak)
+            tmp = _tmp_name(bak)       # round 6: swept if cut short
+            dst = sqlite3.connect(tmp)
+            try:
+                con.backup(dst)
+            finally:
+                dst.close()
+            os.replace(tmp, bak)
         except (sqlite3.Error, OSError) as e:
             LOG.info("history backup skipped: %s", e)
 
@@ -29937,6 +30514,8 @@ def remove_history_copies(path, live_too=False):
     import glob
     files = [path + ".bak", path + ".bak.tmp"] + \
         glob.glob(glob.escape(path) + ".v*.bak") + \
+        glob.glob(glob.escape(path) + ".bak.tmp*") + \
+        glob.glob(glob.escape(path) + ".v*.bak.tmp*") + \
         glob.glob(glob.escape(path) + ".corrupt-*")
     if live_too:
         files += [path, path + "-wal", path + "-shm"]
@@ -30530,7 +31109,7 @@ Confidence ¦ Confiance ¦ Confianza
 Evidence ¦ Preuve ¦ Prueba
 Status ¦ État ¦ Estado
 Traffic ↑/↓ ¦ Trafic ↑/↓ ¦ Tráfico ↑/↓
-Last seen ¦ Vu pour la dernière fois ¦ Visto por última vez
+Last seen ¦ Vu en dernier ¦ Última vez
 Websites and online services your devices looked up or connected to. ¦ Sites web et services en ligne que vos appareils ont recherchés ou contactés. ¦ Sitios web y servicios en línea que sus dispositivos buscaron o a los que se conectaron.
 Seen via ¦ Vu via ¦ Visto mediante
 Category ¦ Catégorie ¦ Categoría
@@ -30539,7 +31118,7 @@ Lookups / visits ¦ Recherches / visites ¦ Búsquedas / visitas
 How we know ¦ Comment on le sait ¦ Cómo lo sabemos
 Traffic ¦ Trafic ¦ Tráfico
 Contacted by ¦ Contacté par ¦ Contactado por
-First seen ¦ Vu pour la première fois ¦ Visto por primera vez
+First seen ¦ Vu en premier ¦ Primera vez
 Where ¦ Où ¦ Dónde
 Server IPs ¦ IP des serveurs ¦ IP de servidores
 Connections — each row is one conversation between a device and something else. Upload is what the device sent; download is what it received. ¦ Connexions — chaque ligne est une conversation entre un appareil et autre chose. L'envoi est ce que l'appareil a émis ; le téléchargement ce qu'il a reçu. ¦ Conexiones — cada fila es una conversación entre un dispositivo y otra cosa. La subida es lo que envió el dispositivo; la descarga, lo que recibió.
@@ -30710,7 +31289,7 @@ Start Monitoring, Demo Mode, the Quick Start Guide and Diagnostics in one place 
 Start watching automatically when MiniWireshark opens ¦ Commencer à observer automatiquement à l'ouverture ¦ Empezar a observar automáticamente al abrir MiniWireshark
 Picks the best network card for you and begins right away. Turn off to choose a card and press Start yourself. ¦ Choisit la meilleure carte réseau et commence aussitôt. Désactivez pour choisir une carte et démarrer vous-même. ¦ Elige la mejor tarjeta de red y empieza enseguida. Desactívelo para elegir la tarjeta y pulsar Empezar usted mismo.
 Ask before clearing data ¦ Demander avant d'effacer les données ¦ Preguntar antes de borrar los datos
-Shows a confirmation before Clear wipes the devices, websites and alerts collected so far. ¦ Demande confirmation avant qu'Effacer supprime les appareils, sites et alertes collectés. ¦ Pide confirmación antes de que Borrar elimine los dispositivos, sitios y alertas recogidos.
+Shows a confirmation before Clear wipes the devices, websites and alerts collected so far, and before the Stop key stops watching. ¦ Demande confirmation avant qu'Effacer supprime les appareils, sites et alertes collectés, et avant que la touche Arrêter arrête l'observation. ¦ Pide confirmación antes de que Borrar elimine los dispositivos, sitios y alertas recogidos, y antes de que la tecla Detener detenga la observación.
 Explanations ¦ Explications ¦ Explicaciones
 Include plain-English guidance ¦ Inclure des conseils en langage simple ¦ Incluir consejos en lenguaje sencillo
 Adds “what should I check?” advice to device cards, alerts and the Security check. Turn off for just the facts. ¦ Ajoute des conseils « que dois-je vérifier ? » aux fiches d'appareils, alertes et au contrôle de sécurité. Désactivez pour n'avoir que les faits. ¦ Añade consejos de «¿qué debo comprobar?» a las fichas de dispositivos, alertas y la revisión de seguridad. Desactívelo para ver solo los hechos.
@@ -31305,7 +31884,7 @@ Full report (HTML) ¦ Rapport complet (HTML) ¦ Informe completo (HTML)
 Health checks send a few tiny test connections, so they only run while watching live with Active Scanning on (not in Quiet Mode). ¦ Les vérifications de santé envoient quelques minuscules connexions de test : elles ne tournent que pendant l'observation en direct avec l'analyse active (pas en mode discret). ¦ Las comprobaciones de salud envían unas pocas conexiones de prueba diminutas, así que solo se ejecutan al observar en directo con la exploración activa (no en modo silencioso).
 Help & glossary ¦ Aide et glossaire ¦ Ayuda y glosario
 Hide the inspector (F2 shows it again) ¦ Masquer l'inspecteur (F2 le réaffiche) ¦ Ocultar el inspector (F2 lo vuelve a mostrar)
-History is off, but old history or saved sessions are still on this computer. Delete them? ¦ L'historique est désactivé, mais un ancien historique ou des sessions enregistrées sont encore sur cet ordinateur. Les supprimer ? ¦ El historial está desactivado, pero aún hay un historial antiguo o sesiones guardadas en este equipo. ¿Borrarlos?
+History is off, but old history, saved sessions or recent filters are still on this computer. Delete them? ¦ L'historique est désactivé, mais un ancien historique, des sessions enregistrées ou des filtres récents sont encore sur cet ordinateur. Les supprimer ? ¦ El historial está desactivado, pero aún hay un historial antiguo, sesiones guardadas o filtros recientes en este equipo. ¿Borrarlos?
 Load session error ¦ Erreur de chargement de session ¦ Error al cargar la sesión
 Load session ¦ Charger une session ¦ Cargar sesión
 Mask IP and hardware addresses (recommended) ¦ Masquer les adresses IP et matérielles (recommandé) ¦ Ocultar direcciones IP y físicas (recomendado)
@@ -31385,7 +31964,7 @@ Undo selected ¦ Annuler la sélection ¦ Deshacer lo seleccionado
 Update available ¦ Mise à jour disponible ¦ Actualización disponible
 Update rolled back ¦ Mise à jour annulée ¦ Actualización revertida
 What this computer can and can't see. Click for the full coverage report. ¦ Ce que cet ordinateur peut voir ou non. Cliquez pour le rapport de couverture complet. ¦ Lo que este equipo puede y no puede ver. Haga clic para el informe de cobertura completo.
-Yes = delete ALL stored history: the history, saved packets, the last autosave, crash copies, your device names and notes, remembered networks and the list of programs that wait for connections.⏎No = delete only the selected device's history (Devices tab). ¦ Oui = supprimer TOUT l'historique enregistré : l'historique, les paquets enregistrés, la dernière sauvegarde automatique, les copies après plantage, les noms et notes de vos appareils, les réseaux mémorisés et la liste des programmes qui attendent des connexions.⏎Non = supprimer seulement l'historique de l'appareil sélectionné (onglet Appareils). ¦ Sí = borrar TODO el historial guardado: el historial, los paquetes guardados, el último guardado automático, las copias tras un fallo, los nombres y notas de sus dispositivos, las redes recordadas y la lista de programas que esperan conexiones.⏎No = borrar solo el historial del dispositivo seleccionado (pestaña Dispositivos).
+Yes = delete ALL stored history: the history, saved packets, the last autosave, crash copies, your device names and notes, remembered networks, the list of programs that wait for connections, recent filters, places on the Map, the website categories you chose and alert rules for one device or address.⏎No = delete only the selected device's history (Devices tab). ¦ Oui = supprimer TOUT l'historique enregistré : l'historique, les paquets enregistrés, la dernière sauvegarde automatique, les copies après plantage, les noms et notes de vos appareils, les réseaux mémorisés, la liste des programmes qui attendent des connexions, les filtres récents, les emplacements sur la Carte, les catégories de sites que vous avez choisies et les règles d'alerte pour un seul appareil ou une seule adresse.⏎Non = supprimer seulement l'historique de l'appareil sélectionné (onglet Appareils). ¦ Sí = borrar TODO el historial guardado: el historial, los paquetes guardados, el último guardado automático, las copias tras un fallo, los nombres y notas de sus dispositivos, las redes recordadas, la lista de programas que esperan conexiones, los filtros recientes, los lugares en el Mapa, las categorías de sitios que eligió y las reglas de alerta para un solo dispositivo o dirección.⏎No = borrar solo el historial del dispositivo seleccionado (pestaña Dispositivos).
 You have unsaved changes. Close without saving? ¦ Vous avez des modifications non enregistrées. Fermer sans enregistrer ? ¦ Tiene cambios sin guardar. ¿Cerrar sin guardar?
 Your device corrections (undo) ¦ Vos corrections d'appareils (annuler) ¦ Sus correcciones de dispositivos (deshacer)
 Your identity corrections ¦ Vos corrections d'identité ¦ Sus correcciones de identidad
@@ -31393,6 +31972,8 @@ Your networks ¦ Vos réseaux ¦ Sus redes
 now (green = online) ¦ maintenant (vert = en ligne) ¦ ahora (verde = conectado)
 waiting to retry download ¦ en attente d'un nouvel essai de téléchargement ¦ esperando para reintentar la descarga
 Stopped watching. ¦ Observation arrêtée. ¦ Observación detenida.
+Stop watching? ¦ Arrêter l'observation ? ¦ ¿Detener la observación?
+Watching the network stops. Everything seen so far stays on screen.⏎⏎Stop now? ¦ L'observation du réseau s'arrête. Tout ce qui a été vu reste à l'écran.⏎⏎Arrêter maintenant ? ¦ La observación de la red se detiene. Todo lo visto hasta ahora sigue en pantalla.⏎⏎¿Detener ahora?
 Unsaved changes ¦ Modifications non enregistrées ¦ Cambios sin guardar
 This is mine ¦ C'est à moi ¦ Es mío
 Settings saved. ¦ Paramètres enregistrés. ¦ Ajustes guardados.
@@ -32706,6 +33287,7 @@ Danger: %s ¦ Danger : %s ¦ Peligro: %s
 Danger (%d times): %s ¦ Danger (%d fois) : %s ¦ Peligro (%d veces): %s
 What changed: the story ¦ Ce qui a changé : le récit ¦ Qué cambió: el relato
 Read the story ¦ Lire le récit ¦ Leer el relato
+Your settings can't be read: there is a folder where the settings file should be. This run uses the defaults and leaves the folder as it is; move or rename that folder so your settings can be saved. ¦ Vos réglages ne peuvent pas être lus : il y a un dossier à la place du fichier de réglages. Cette session utilise les réglages par défaut et laisse le dossier tel quel ; déplacez ou renommez ce dossier pour que vos réglages puissent être enregistrés. ¦ No se pueden leer sus ajustes: hay una carpeta donde debería estar el archivo de ajustes. Esta sesión usa los ajustes predeterminados y deja la carpeta como está; mueva o cambie el nombre de esa carpeta para que sus ajustes se puedan guardar.
 The changes of the last days in plain sentences, with what is new since you last looked. ¦ Les changements des derniers jours en phrases simples, avec ce qui est nouveau depuis votre dernier coup d'œil. ¦ Los cambios de los últimos días con frases sencillas, con lo nuevo desde la última vez que miró.
 1 change in this data. ¦ 1 changement dans ces données. ¦ 1 cambio en estos datos.
 %d changes in this data. ¦ %d changements dans ces données. ¦ %d cambios en estos datos.
@@ -33073,7 +33655,7 @@ router and Internet seen in traffic, not checked yet ¦ routeur et Internet vus 
 Weak signal — likely to make the connection slower. Move closer to the router or remove obstacles. ¦ Signal faible — risque de ralentir la connexion. Rapprochez-vous de la box ou enlevez les obstacles. ¦ Señal débil — probablemente haga la conexión más lenta. Acérquese al router o quite obstáculos.
 Time window ¦ Période ¦ Periodo
 %s of data so far ¦ %s de données pour l'instant ¦ %s de datos por ahora
-Device evidence: is it a real device? ●●● High (score 60+) · ●●○ Medium (score 30+) · ●○○ Low (score 10+) · ○○○ Unconfirmed. Evidence: how three facts are known, in order: on your network · name · kind (◉ Observed · ◈ Reported · ◎ Correlated · ◌ Inferred · ? Unknown). “Likely” or “Possibly” before a kind is how sure that guess is, so a device with High evidence can still be only “Possibly” a printer. ¦ Preuves de l'appareil : est-ce un vrai appareil ? ●●● Élevée (score 60+) · ●●○ Moyenne (score 30+) · ●○○ Faible (score 10+) · ○○○ Non confirmé. Preuves : comment trois faits sont connus, dans l'ordre : sur votre réseau · nom · type (◉ Observé · ◈ Signalé · ◎ Corrélé · ◌ Déduit · ? Inconnu). « Probable » ou « Peut-être » devant un type dit à quel point cette supposition est sûre : un appareil aux preuves élevées peut n'être que « Peut-être » une imprimante. ¦ Pruebas del dispositivo: ¿es un dispositivo real? ●●● Alta (puntuación 60+) · ●●○ Media (puntuación 30+) · ●○○ Baja (puntuación 10+) · ○○○ Sin confirmar. Pruebas: cómo se conocen tres datos, en orden: en su red · nombre · tipo (◉ Observado · ◈ Informado · ◎ Correlacionado · ◌ Deducido · ? Desconocido). «Probable» o «Posiblemente» delante de un tipo indica lo segura que es esa suposición, así que un dispositivo con pruebas altas puede ser solo «Posiblemente» una impresora.
+Device evidence: is it a real device? ●●● High (score 60+) · ●●○ Medium (score 30+) · ●○○ Low (score 10+) · ○○○ Unconfirmed. The Evidence column is off unless you turn it on (right-click a heading → Columns); it shows how three facts are known, in order: on your network · name · kind (◉ Observed · ◈ Reported · ◎ Correlated · ◌ Inferred · ? Unknown). “Likely” or “Possibly” before a kind is how sure that guess is, so a device with High evidence can still be only “Possibly” a printer. ¦ Preuves de l'appareil : est-ce un vrai appareil ? ●●● Élevée (score 60+) · ●●○ Moyenne (score 30+) · ●○○ Faible (score 10+) · ○○○ Non confirmé. La colonne Preuve est masquée sauf si vous l'affichez (clic droit sur un en-tête → Colonnes) ; elle montre comment trois faits sont connus, dans l'ordre : sur votre réseau · nom · type (◉ Observé · ◈ Signalé · ◎ Corrélé · ◌ Déduit · ? Inconnu). « Probable » ou « Peut-être » devant un type dit à quel point cette supposition est sûre : un appareil aux preuves élevées peut n'être que « Peut-être » une imprimante. ¦ Pruebas del dispositivo: ¿es un dispositivo real? ●●● Alta (puntuación 60+) · ●●○ Media (puntuación 30+) · ●○○ Baja (puntuación 10+) · ○○○ Sin confirmar. La columna Prueba está oculta salvo que la active (clic derecho en un encabezado → Columnas); muestra cómo se conocen tres datos, en orden: en su red · nombre · tipo (◉ Observado · ◈ Informado · ◎ Correlacionado · ◌ Deducido · ? Desconocido). «Probable» o «Posiblemente» delante de un tipo indica lo segura que es esa suposición, así que un dispositivo con pruebas altas puede ser solo «Posiblemente» una impresora.
 The devices on your local network. Device evidence shows how sure it is that each one is a real device — an IP address alone is never enough to count as a device. ¦ Les appareils de votre réseau local. Les preuves de l'appareil indiquent à quel point il est sûr que chacun est un vrai appareil — une adresse IP seule ne suffit jamais à compter comme appareil. ¦ Los dispositivos de su red local. Las pruebas del dispositivo indican lo seguro que es que cada uno sea un dispositivo real — una dirección IP sola nunca basta para contar como dispositivo.
 # 5.3.4: Websites → Local services
 Local services ¦ Services locaux ¦ Servicios locales
@@ -33087,7 +33669,8 @@ Program ¦ Programme ¦ Programa
 Listens on ¦ À l'écoute sur ¦ Escucha en
 Who can reach it ¦ Qui peut le joindre ¦ Quién puede acceder
 Some programs couldn't be named or listed without administrator rights. ¦ Certains programmes n'ont pas pu être nommés ou listés sans les droits d'administrateur. ¦ Algunos programas no se pudieron nombrar ni listar sin derechos de administrador.
-%d reachable from the network ¦ %d joignable(s) depuis le réseau ¦ %d accesible(s) desde la red
+%d reachable from the network ¦ %d joignables depuis le réseau ¦ %d accesibles desde la red
+1 reachable from the network ¦ 1 joignable depuis le réseau ¦ 1 accesible desde la red
 Reading the list of services on this computer… ¦ Lecture de la liste des services de cet ordinateur… ¦ Leyendo la lista de servicios de este equipo…
 The list of services needs the optional psutil component (Settings → Repair). ¦ La liste des services nécessite le composant facultatif psutil (Paramètres → Réparer). ¦ La lista de servicios necesita el componente opcional psutil (Ajustes → Reparar).
 This computer didn't let MiniWireshark read the list of services without administrator rights. ¦ Cet ordinateur n'a pas laissé MiniWireshark lire la liste des services sans les droits d'administrateur. ¦ Este equipo no dejó que MiniWireshark leyera la lista de servicios sin derechos de administrador.
@@ -33466,6 +34049,19 @@ A content delivery network's server holds files for many websites and apps; apps
 News, pictures and updates are fetched like this. It matters if the device should be idle. ¦ Les actualités, images et mises à jour sont récupérées ainsi. C'est important si l'appareil devrait être inactif. ¦ Las noticias, imágenes y actualizaciones se descargan así. Importa si el dispositivo debería estar inactivo.
 A content delivery network's server, looked up by name, was contacted at nearly even intervals. ¦ Le serveur d'un réseau de diffusion de contenu, dont le nom a été cherché, a été contacté à intervalles presque réguliers. ¦ Se contactó con el servidor de una red de distribución de contenidos, cuyo nombre se buscó, a intervalos casi regulares.
 A gadget contacted a server it looked up by name, at nearly even intervals. ¦ Un objet connecté a contacté un serveur dont il avait cherché le nom, à intervalles presque réguliers. ¦ Un dispositivo conectado contactó con un servidor cuyo nombre había buscado, a intervalos casi regulares.
+This looks like a video or voice call. ¦ Cela ressemble à un appel vidéo ou vocal. ¦ Parece una videollamada o una llamada de voz.
+This looks like a video upload. ¦ Cela ressemble à l'envoi d'une vidéo. ¦ Parece la subida de un vídeo.
+A call sends your picture and sound for as long as it lasts. ¦ Un appel envoie votre image et votre son pendant toute sa durée. ¦ Una llamada envía su imagen y su sonido mientras dura.
+Phones and computers often upload videos while they charge at night. ¦ Les téléphones et les ordinateurs envoient souvent des vidéos pendant qu'ils chargent la nuit. ¦ Los teléfonos y los ordenadores suelen subir vídeos mientras se cargan de noche.
+Most of the data went to a known call service, looked up by name, at an address the service publishes as its own. ¦ La plupart des données sont allées vers un service d'appels connu, dont le nom a été cherché, à une adresse que ce service déclare comme la sienne. ¦ La mayoría de los datos fueron a un servicio de llamadas conocido, cuyo nombre se buscó, en una dirección que el servicio publica como suya.
+Most of the data went to a known video site, looked up by name, at an address the site publishes as its own. ¦ La plupart des données sont allées vers un site de vidéos connu, dont le nom a été cherché, à une adresse que ce site déclare comme la sienne. ¦ La mayoría de los datos fueron a un sitio de vídeos conocido, cuyo nombre se buscó, en una dirección que el sitio publica como suya.
+This looks like a NAS copying its backup to the Internet. ¦ Cela ressemble à un NAS qui copie sa sauvegarde sur Internet. ¦ Parece un NAS que copia su copia de seguridad en Internet.
+A NAS often copies its backup to a cloud service at night. It matters if you never set that up. ¦ Un NAS copie souvent sa sauvegarde vers un service en ligne la nuit. C'est important si vous ne l'avez jamais configuré. ¦ Un NAS suele copiar su copia de seguridad a un servicio en la nube de noche. Importa si nunca lo configuró.
+You marked this device as a NAS. ¦ Vous avez indiqué que cet appareil est un NAS. ¦ Usted indicó que este dispositivo es un NAS.
+One of them may be a device pretending to be your router: devices that take an address from it send their Internet traffic and name lookups through it. ¦ L'un d'eux est peut-être un appareil qui se fait passer pour votre box : les appareils qui en reçoivent une adresse font passer par lui leur trafic Internet et leurs recherches de noms. ¦ Puede que uno de ellos sea un dispositivo que se hace pasar por su router: los dispositivos que reciben una dirección de él envían a través de él su tráfico de Internet y sus búsquedas de nombres.
+Two DHCP servers named different routers, and nothing showed which one is real. ¦ Deux serveurs DHCP ont indiqué des routeurs différents, et rien n'a montré lequel est le vrai. ¦ Dos servidores DHCP indicaron routers distintos y nada mostró cuál es el verdadero.
+It hands out addresses (DHCP) and names itself as the router, but so does another device, so it is not confirmed as your router ¦ Il distribue des adresses (DHCP) et se désigne comme routeur, mais un autre appareil le fait aussi, donc il n'est pas confirmé comme votre box ¦ Reparte direcciones (DHCP) y se indica a sí mismo como router, pero otro dispositivo también lo hace, así que no está confirmado como su router
+It looks like a NAS, and a NAS often copies its backup to a cloud service at night. If this is your NAS and you set that up, right-click it in Devices, choose Set device type… and pick NAS: a later night backup is then only an INFO, out of Unusual activity. ¦ Il ressemble à un NAS, et un NAS copie souvent sa sauvegarde vers un service en ligne la nuit. Si c'est votre NAS et que vous l'avez configuré, faites un clic droit dessus dans Appareils, choisissez Définir le type d'appareil… et prenez NAS : une sauvegarde de nuit suivante ne sera alors qu'une INFO, en dehors d'« Activité inhabituelle ». ¦ Parece un NAS, y un NAS suele copiar su copia de seguridad en un servicio en línea de noche. Si es su NAS y usted lo configuró, haga clic derecho sobre él en Dispositivos, elija Definir el tipo de dispositivo… y escoja NAS: una copia de seguridad de noche posterior será entonces solo una INFO, fuera de «Actividad inusual».
 tab ¦ onglet ¦ pestaña
 view ¦ vue ¦ vista
 action ¦ action ¦ acción
@@ -34970,6 +35566,59 @@ _A4_TEXT = [
 ]
 EVENT_PATTERNS[:0] = _A4_EVENT
 I18N_PATTERNS[:0] = _A4_EVENT + _A4_TEXT
+# sixth audit: a call, a video upload or a NAS at night; two DHCP servers
+# when nothing shows which one is real
+_A6_EVENT = [
+    (r"(.+) was on a call at night \((.+)\)",
+     r"\1 était en appel pendant la nuit (\2)",
+     r"\1 estuvo en una llamada durante la noche (\2)"),
+    (r"(.+) uploaded a video at night \((.+)\)",
+     r"\1 a envoyé une vidéo pendant la nuit (\2)",
+     r"\1 subió un vídeo durante la noche (\2)"),
+    (r"(.+) sent (\d[\d.,]* [KMGT]?B) at night \(you marked it as a NAS\)",
+     r"\1 a envoyé \2 pendant la nuit (vous l'avez indiqué comme NAS)",
+     r"\1 envió \2 durante la noche (usted lo indicó como NAS)"),
+    (r"Two devices hand out addresses and different routers: (\S+) and "
+     r"(\S+)",
+     r"Deux appareils distribuent des adresses et des routeurs différents "
+     r": \1 et \2",
+     r"Dos dispositivos reparten direcciones y routers distintos: \1 y "
+     r"\2"),
+]
+_A6_TEXT = [
+    (r"At night it sent (\d[\d.,]* [KMGT]?B) to (.+) in (\d+) minutes\. "
+     r"That is (.+), a video and voice call service\.",
+     "Pendant la nuit, il a envoyé \\1 à {t2} en \\3 minutes. C'est \\4, "
+     "un service d'appels vidéo et vocaux.",
+     "Durante la noche envió \\1 a {t2} en \\3 minutos. Es \\4, un "
+     "servicio de videollamadas y llamadas de voz."),
+    (r"At night it sent (\d[\d.,]* [KMGT]?B) to (.+) in (\d+) minutes\. "
+     r"That is (.+), a video site\.",
+     "Pendant la nuit, il a envoyé \\1 à {t2} en \\3 minutes. C'est \\4, "
+     "un site de vidéos.",
+     "Durante la noche envió \\1 a {t2} en \\3 minutos. Es \\4, un "
+     "sitio de vídeos."),
+    (r"At night it sent (\d[\d.,]* [KMGT]?B) to (.+) in (\d+) minutes\. "
+     r"You marked this device as a NAS\.",
+     "Pendant la nuit, il a envoyé \\1 à {t2} en \\3 minutes. Vous avez "
+     "indiqué que cet appareil est un NAS.",
+     "Durante la noche envió \\1 a {t2} en \\3 minutos. Usted indicó "
+     "que este dispositivo es un NAS."),
+    (r"(\d+) different DHCP servers seen: ([0-9a-fA-F.:, ]+)\. (\S+) gives "
+     r"(\S+) as the router and (\S+) gives (\S+)\. Nothing in what was "
+     r"seen shows which router the Internet traffic really goes through, "
+     r"so neither is taken as your router\.",
+     r"\1 serveurs DHCP différents vus : \2. \3 donne \4 comme routeur et "
+     r"\5 donne \6. Rien de ce qui a été vu ne montre par quel routeur "
+     r"passe vraiment le trafic Internet, donc aucun n'est pris pour votre "
+     r"box.",
+     r"Se vieron \1 servidores DHCP distintos: \2. \3 da \4 como router y "
+     r"\5 da \6. Nada de lo que se vio muestra por qué router pasa de "
+     r"verdad el tráfico de Internet, así que ninguno se toma como su "
+     r"router."),
+]
+EVENT_PATTERNS[:0] = _A6_EVENT
+I18N_PATTERNS[:0] = _A6_EVENT + _A6_TEXT
 I18N_PATTERNS.sort(key=lambda x: 0 if x[0].startswith(
     ("Online now", r"Offline since (\d\d")) else 1)
 _I18N_PATTERNS_RX = [(re.compile(r"\A" + p + r"\Z", re.S), fr, es)
@@ -35801,6 +36450,58 @@ class FlowLayout:
             page._mw_flow_wait.append(self)
         return True
 
+    def _break(self, items, W):
+        """The rows `items` take in W pixels: lists of [it, x, width]."""
+        lefts = [it for it in items if it["side"] != "right"]
+        rights = [it for it in items if it["side"] == "right"]
+        rows = [[]]          # each: list of (it, x, w)
+        x = xmin = 0         # xmin: a stretching label may shrink
+        for unit in self._units(lefts):
+            umin = sum(min(self._wid(it), 260) if it["expand"]
+                       else self._wid(it) for it in unit)
+            if xmin > 0 and xmin + umin > W:
+                rows.append([])
+                x = xmin = 0
+            for it in unit:
+                wd = self._wid(it)
+                rows[-1].append([it, x, wd])
+                x += wd
+            xmin += umin
+        # right-hand items, the first packed is the right-most
+        left_end = xmin
+        xr = W
+        for it in rights:
+            wd = self._wid(it)
+            if xr - wd < left_end and (xr < W or left_end > 0):
+                rows.append([])
+                left_end, xr = 0, W
+            xr -= wd
+            rows[-1].append([it, xr, wd])
+        return rows
+
+    def measure(self, hide=(), show=(), width=None):
+        """The height the row takes at its width (or `width`) with the
+        widgets in `hide` left out and those in `show` put back (nothing
+        moves)."""
+        f = self.f
+        items = [it for it in self.items if (it["shown"] or it["w"] in show)
+                 and it["w"] not in hide and it["w"].winfo_exists()]
+        pl, pt, pr, pb = self._inner()
+        fw = f.winfo_width() if width is None else width
+        W = fw - pl - pr
+        if fw <= 1:
+            W = sum(self._wid(it) for it in items)
+        return sum(max(r[0]["w"].winfo_reqheight() + sum(r[0]["pady"])
+                       for r in row)
+                   for row in self._break(items, W) if row) + pt + pb
+
+    def show(self, w):
+        """Put back a widget hide() took out, where it was."""
+        it = self.find(w)
+        if it is not None and not it["shown"]:
+            it["shown"] = True
+            self.schedule()
+
     @staticmethod
     def page_shown(page):
         """A notebook page is on screen: its waiting rows are laid out
@@ -35821,31 +36522,7 @@ class FlowLayout:
             W = f.winfo_width() - pl - pr
             if f.winfo_width() <= 1:
                 W = natural
-            lefts = [it for it in items if it["side"] != "right"]
-            rights = [it for it in items if it["side"] == "right"]
-            rows = [[]]          # each: list of (it, x, w)
-            x = xmin = 0         # xmin: a stretching label may shrink
-            for unit in self._units(lefts):
-                umin = sum(min(self._wid(it), 260) if it["expand"]
-                           else self._wid(it) for it in unit)
-                if xmin > 0 and xmin + umin > W:
-                    rows.append([])
-                    x = xmin = 0
-                for it in unit:
-                    wd = self._wid(it)
-                    rows[-1].append([it, x, wd])
-                    x += wd
-                xmin += umin
-            # right-hand items, the first packed is the right-most
-            left_end = xmin
-            xr = W
-            for it in rights:
-                wd = self._wid(it)
-                if xr - wd < left_end and (xr < W or left_end > 0):
-                    rows.append([])
-                    left_end, xr = 0, W
-                xr -= wd
-                rows[-1].append([it, xr, wd])
+            rows = self._break(items, W)
             # an expanding item takes what is left of its row; anything
             # wider than the frame is clamped to it
             for row in rows:
@@ -36331,7 +37008,12 @@ def share_tree_width(tree):
     by" cut to a few letters, while the fixed columns kept all their
     width. The fixed columns now give up width (down to their own
     heading's) until every stretching column shows its heading; they
-    get it back as the table grows again. → True when widths changed."""
+    get it back as the table grows again. → True when widths changed.
+    A table that sizes its own columns (_mw_fits_itself: Local services,
+    fifth audit) does it its own way, at the same moments."""
+    own = getattr(tree, "_mw_fits_itself", None)
+    if own is not None:
+        return bool(own())
     try:
         avail = tree.winfo_width()
         if avail < 100:
@@ -36401,6 +37083,15 @@ def share_tree_width(tree):
                 info[c][0] >= info[c][2] for c in stretch):
             return False                       # nothing is cut
         excess = {c: max(0, base[c] - info[c][2]) for c in fixed}
+        # (fourth audit) a column of a few fixed words (the Alerts
+        # Severity) keeps room for them while the other fixed columns can
+        # give up enough; only past that does it go down to its heading
+        words = {c: max(info[c][2], min(base[c], cell_texts_width(tree, c)))
+                 for c in fixed}
+        if any(words[c] > info[c][2] for c in fixed):
+            spare = {c: max(0, base[c] - words[c]) for c in fixed}
+            if sum(spare.values()) >= sum(base.values()) - room:
+                excess = spare
         total = sum(excess.values())
         if total <= 0:
             return False
@@ -36420,9 +37111,19 @@ def share_tree_width(tree):
                 changed = True
         left = avail - sum(new.values())
         s_need = sum(info[c][2] for c in stretch)
+        # (sixth audit, 1024 wide in French and Spanish) Tk squeezes the
+        # stretching columns only when the table changes size: an Alerts
+        # table first shown in a narrow window kept "What happened" at
+        # 440 pixels and pushed Confidence, Times and Status off its
+        # right edge. Wider than the room the fixed columns leave, they
+        # get that room (never less than their heading).
+        wide = sum(info[c][0] for c in stretch) > left + 4
+        with contextlib.suppress(tk.TclError):
+            if str(tree.cget("xscrollcommand")):
+                wide = False                 # reached with the scroll bar
         for c in stretch:
             want = max(info[c][2], left * info[c][2] // max(1, s_need))
-            if info[c][0] < info[c][2] or changed:
+            if info[c][0] < info[c][2] or changed or wide:
                 if want != info[c][0]:
                     tree.column(c, width=want)
                     changed = True
@@ -36490,14 +37191,23 @@ def dialog_contract(win):
 def focus_ring(widget, color="#2b7de9", width=2):
     """A visible ring when a plain widget (a label used as a tab) has the
     keyboard focus. The ring takes the place of padding, so nothing
-    moves or grows."""
+    moves or grows. The padding it gives back is the widget's own as it
+    is now (ring_padding), not the one it had when it was made: compact
+    mode trims the tab labels' padding on a short window, and a tab that
+    had the keyboard took its full padding back when the focus left
+    (sixth audit, Windows runner: 4 pixels more per row of tabs, so
+    Local services showed 4 rows instead of 5)."""
     try:
-        padx = int(str(widget.cget("padx")))
-        pady = int(str(widget.cget("pady")))
+        widget._mw_ring_pad = (int(str(widget.cget("padx"))),
+                               int(str(widget.cget("pady"))))
     except (tk.TclError, ValueError):
         return
+    widget._mw_ring_w = width
+    widget._mw_ring_on = False
 
     def on(_e=None):
+        padx, pady = widget._mw_ring_pad
+        widget._mw_ring_on = True
         with contextlib.suppress(tk.TclError):
             widget.configure(highlightthickness=width, highlightcolor=color,
                              highlightbackground=color,
@@ -36505,11 +37215,34 @@ def focus_ring(widget, color="#2b7de9", width=2):
                              pady=max(0, pady - width))
 
     def off(_e=None):
+        padx, pady = widget._mw_ring_pad
+        widget._mw_ring_on = False
         with contextlib.suppress(tk.TclError):
             widget.configure(highlightthickness=0, padx=padx, pady=pady)
     widget.bind("<FocusIn>", on, add="+")
     widget.bind("<FocusOut>", off, add="+")
     off()
+
+
+def ring_padding(widget, padx=None, pady=None):
+    """Change the padding of a widget that may carry a focus_ring: the
+    ring keeps taking its width out of the new padding while it shows,
+    and gives the new padding back when the focus leaves."""
+    base = getattr(widget, "_mw_ring_pad", None)
+    try:
+        if base is None:
+            kw = {k: v for k, v in (("padx", padx), ("pady", pady))
+                  if v is not None}
+            if kw:
+                widget.configure(**kw)
+            return
+        padx = base[0] if padx is None else padx
+        pady = base[1] if pady is None else pady
+        widget._mw_ring_pad = (padx, pady)
+        cut = widget._mw_ring_w if widget._mw_ring_on else 0
+        widget.configure(padx=max(0, padx - cut), pady=max(0, pady - cut))
+    except tk.TclError:
+        pass
 
 
 def key_mod_masks(platform=None):
@@ -36713,8 +37446,7 @@ def make_readonly_focusable(txt, color="#2b7de9"):
         with contextlib.suppress(tk.TclError):
             text = txt.get("sel.first", "sel.last")
             if text:
-                txt.clipboard_clear()
-                txt.clipboard_append(text)
+                put_on_clipboard(txt, text)
         return "break"
     for seq in ("<Control-a>", "<Control-A>"):
         txt.bind(seq, select_all, add="+")
@@ -37921,7 +38653,8 @@ SETTINGS_PAGES = [
              {"key": "general.confirm_before_clear", "type": "bool",
               "label": "Ask before clearing data",
               "help": "Shows a confirmation before Clear wipes the devices, "
-                      "websites and alerts collected so far."},
+                      "websites and alerts collected so far, and before the "
+                      "Stop key stops watching."},
          ]},
          {"title": "Explanations", "controls": [
              {"key": "appearance.explain_inline", "type": "bool",
@@ -41549,6 +42282,138 @@ def safe_tsv_row(cells):
     return "\t".join(str(_SafeCsv.cell(c)) for c in cells)
 
 
+_CLIP_LINE_BREAK = re.compile(r"(\r\n|\r|\n)")
+_CLIP_RULE_LINE = re.compile(r"=+|-+")
+
+
+def clipboard_safe_text(text):
+    """Seventh audit (security): text of several lines went to the
+    clipboard as it was, so "=1+1\\nsecond line" or "Device\\n=cmd|x"
+    became a formula when pasted into a spreadsheet (each line is a row
+    there, each tab a cell). Every cell of every line now gets the guard
+    of a CSV cell: one that starts with = + - or @ gets a ' in front.
+    The rest is left as it is, so a report stays readable; a line made
+    only of = or - (a heading's underline) can't run anything and is
+    kept. A guarded text is not guarded twice."""
+    if not isinstance(text, str) or not text:
+        return text
+    parts = _CLIP_LINE_BREAK.split(text)
+    for i in range(0, len(parts), 2):
+        if parts[i] and not _CLIP_RULE_LINE.fullmatch(parts[i]):
+            parts[i] = "\t".join("'" + c if c.startswith(_SafeCsv.BAD)
+                                  else c for c in parts[i].split("\t"))
+    return "".join(parts)
+
+
+def _clip_box_editable(tkapp, w):
+    """True for a text box the person can type into (a search box, a
+    name being edited): what they copy from it is copied as it is."""
+    try:
+        cls = str(tkapp.call("winfo", "class", w))
+        if cls in ("Entry", "Spinbox"):
+            return str(tkapp.call(w, "cget", "-state")) == "normal"
+        if cls in ("TEntry", "TCombobox", "TSpinbox"):
+            return bool(tkapp.getboolean(tkapp.call(
+                w, "instate", "!disabled !readonly")))
+    except (tk.TclError, TypeError, ValueError):
+        pass
+    return False
+
+
+_TK_CLIP_APPEND = []          # tkinter's own clipboard_append, once
+
+
+def _guarded_clipboard_append(self, string, **kw):
+    """Every tkinter clipboard_append of this program goes through the
+    guard (clipboard_safe_text), whichever widget or code calls it; what
+    is copied from a box the person types into is left as it is. (A text
+    appended in pieces is guarded piece by piece: a piece that starts in
+    the middle of a line can get a ' it didn't need, never one less.)"""
+    if not _clip_box_editable(self.tk, str(self)):
+        string = clipboard_safe_text(str(string))
+    return _TK_CLIP_APPEND[0](self, string, **kw)
+
+
+def install_clipboard_guard(widget):
+    """Seventh audit (security): no copy can skip the guard.
+    - tkinter's clipboard_append, from any widget or line of this
+      program, is guarded before it reaches Tk (_guarded_clipboard_append);
+    - Tk's own Copy and Cut (Ctrl+C or Ctrl+X in any text, entry or list
+      box, and Tk's tk_textCopy / tk_textCut however they are called) are
+      read back right after they ran and put on the clipboard guarded.
+    Text copied from a box the person types into is left as it is. Once
+    per Tk (called before every copy). -> True when the guard is in
+    place. A raw Tcl "clipboard append" is kept out of this file by
+    no_copy_skips_the_guard.
+    Round 8 (Windows CI): Tk on Windows ends the whole process with an
+    access violation on the first clipboard use while the main window
+    has never been made (a window hidden before it was first shown, as
+    while asking for the password); the window is made first."""
+    try:
+        root = widget._root()
+    except (AttributeError, tk.TclError):
+        return False
+    with contextlib.suppress(tk.TclError):
+        root.winfo_id()                 # makes the window if not made yet
+    if getattr(root, "_mw_clip_guard", False):
+        return True
+    if not _TK_CLIP_APPEND:
+        _TK_CLIP_APPEND.append(tk.Misc.clipboard_append)
+        tk.Misc.clipboard_append = _guarded_clipboard_append
+    tkapp = root.tk
+
+    def guard_board(w):
+        if _clip_box_editable(tkapp, w):
+            return
+        try:
+            data = str(root.clipboard_get())
+        except tk.TclError:
+            return                      # nothing, or not text
+        safe = clipboard_safe_text(data)
+        if safe != data:
+            with contextlib.suppress(tk.TclError):
+                root.clipboard_clear()
+                _TK_CLIP_APPEND[0](root, safe)
+
+    def after_copy(e):
+        w = getattr(e, "widget", None)
+        guard_board(str(w) if w is not None else ".")
+        return None
+
+    def after_proc(cmd="", *_rest):
+        # a Tcl execution trace: "tk_textCopy .w" has just run
+        try:
+            w = str(tkapp.splitlist(cmd)[1])
+        except (tk.TclError, IndexError, TypeError):
+            w = "."
+        guard_board(w)
+        return ""
+    try:
+        # the "all" tag: after the widget's own Copy or Cut binding ran
+        root.bind_all("<<Copy>>", after_copy, add="+")
+        root.bind_all("<<Cut>>", after_copy, add="+")
+        name = root.register(after_proc)
+        for proc in ("::tk_textCopy", "::tk_textCut"):
+            if not tkapp.call("info", "procs", proc):
+                tkapp.call("auto_load", proc)
+            if tkapp.call("info", "procs", proc):
+                tkapp.call("trace", "add", "execution", proc, "leave",
+                           name)
+    except tk.TclError:
+        LOG.warning("the clipboard guard could not be put in place")
+        return False
+    root._mw_clip_guard = True
+    return True
+
+
+def put_on_clipboard(widget, text):
+    """Every copy of this program: the text on the clipboard, guarded
+    (clipboard_safe_text). Raises tk.TclError like clipboard_append."""
+    install_clipboard_guard(widget)
+    widget.clipboard_clear()
+    widget.clipboard_append(clipboard_safe_text(text))
+
+
 def copy_to_clipboard(app, text):
     text = hide_credentials(scrub_secrets(text))
     # fourth audit: one value copied on its own (a domain, a device's
@@ -41556,7 +42421,10 @@ def copy_to_clipboard(app, text):
     # a cell too, so a single line gets the formula guard of a copied row
     if "\n" not in text and "\r" not in text:
         text = safe_tsv_row(text.split("\t"))
+    else:
+        text = clipboard_safe_text(text)   # seventh audit: every line
     try:
+        install_clipboard_guard(app.root)
         app.root.clipboard_clear()
         app.root.clipboard_append(text)
         app.root.update_idletasks()
@@ -42095,8 +42963,8 @@ class Charts:
 
         def copy(csv_):
             with contextlib.suppress(tk.TclError):
-                c.clipboard_clear()
-                c.clipboard_append(hide_credentials(cls.chart_text(c, csv_)))
+                put_on_clipboard(c, hide_credentials(cls.chart_text(c,
+                                                                  csv_)))
         m = recycle_popup(tk.Menu(c, tearoff=0))
         m.add_command(label=translate_text("Copy chart data as text"),
                       command=lambda: copy(False))
@@ -42228,7 +43096,11 @@ class BaseTab:
                     continue
                 fixed += w.winfo_reqheight() + _pack_pady(info)
             line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
-            room = h - fixed - 6 * line
+            # (fifth audit) a view may say what its content needs in
+            # pixels (Local services: 5 table rows)
+            content = getattr(self, "_fit_need", None)
+            want = content() if content is not None else None
+            room = h - fixed - (want if want is not None else 6 * line)
             full = 2 * int(top.cget("pady"))
             for c in top.winfo_children():
                 if c.winfo_manager() == "pack":
@@ -42376,6 +43248,7 @@ class BaseTab:
         outer = self.frame
         bar = tk.Frame(outer, bg=WHITE, padx=12)
         bar.pack(fill="x", pady=(6, 0))
+        self._sub_bar = bar
         self._sub_frames, self._sub_btns = {}, {}
         self._sub_cb = on_switch
         for n in names:
@@ -43115,6 +43988,7 @@ class DashboardTab(BaseTab):
         box.pack(fill="x", pady=(0, 2))
         self.answer_box = box
         self.answer_lbls, self.answer_show = {}, {}
+        self.answer_cards = {}          # key -> (card, its "Show me ›")
         for i, (key, question) in enumerate(self.ANSWERS):
             card = tk.Frame(box, bg="#f6f7fa", padx=12, pady=8,
                             highlightbackground="#e0e2e8",
@@ -43139,6 +44013,7 @@ class DashboardTab(BaseTab):
             card.bind("<Configure>", lambda e, lb=a: self._fit_answer(
                 lb, e.width), add="+")
             self.answer_lbls[key] = a
+            self.answer_cards[key] = (card, more)
             box.columnconfigure(i, weight=1, uniform="answer")
         self.honest_lbl = tk.Label(outer, text="", bg=WHITE, fg="#666666",
                                    anchor="w", justify="left",
@@ -43248,6 +44123,25 @@ class DashboardTab(BaseTab):
             if abs(int(float(str(lbl.cget("wraplength")) or 0)) - want) > 4:
                 lbl.configure(wraplength=want)
 
+    def _answer_usable(self, key, on):
+        """Seventh audit (kbd): an answer with nothing to show ("Is
+        anything wrong?" before anything is watched: "Can't tell yet …
+        Press Start watching") kept its card a Tab stop with a "Show me ›"
+        that Return, Space and a click all did nothing for. Such a card
+        is now left out of Tab and loses its "Show me ›" and hand
+        pointer until it has something to show."""
+        card, more = self.answer_cards.get(key, (None, None))
+        if card is None:
+            return
+        with contextlib.suppress(tk.TclError):
+            if str(card.cget("takefocus")) != ("1" if on else "0"):
+                card.configure(takefocus=1 if on else 0,
+                               cursor="hand2" if on else "")
+            if on and not more.winfo_manager():
+                more.pack(anchor="w")
+            elif not on and more.winfo_manager():
+                more.pack_forget()
+
     def _answer_show(self, key):
         fn = self.answer_show.get(key)
         if fn is not None:
@@ -43259,6 +44153,7 @@ class DashboardTab(BaseTab):
         for key, _q in self.ANSWERS:
             text, kind, show = got[key]
             self.answer_show[key] = show
+            self._answer_usable(key, show is not None)
             lbl = self.answer_lbls[key]
             fg = self.ANSWER_FG.get(kind, "#222222")
             table = PALETTES[palette_name(app.theme_name,
@@ -44461,8 +45356,17 @@ class DevicesTab(BaseTab):
 
     def default_cols(self):
         """Beginner's shorter column set is the default, not a lock: the
-        heading's right-click menu shows any column."""
-        cols = [c[0] for c in self.COLS if c[0] != "tags"]
+        heading's right-click menu shows any column.
+        Fifth audit: "Evidence" (◉ ◎ ◌, how a device's presence, name and
+        kind are known) is no longer shown by default. Its cells are only
+        those signs, which a Tk without Xft has no font for: the column
+        was blank for every device in every language, right of "Device
+        evidence", the scale that says how sure MiniWireshark is ("Prueba"
+        next to "Pruebas del dispositivo"). The Inspector and the device
+        card list each fact with how it is known, and the heading's menu
+        (Columns) shows the column."""
+        cols = [c[0] for c in self.COLS if c[0] not in ("tags",
+                                                         "evidence")]
         if self.app.beginner_mode:
             cols = [c for c in cols if c not in ("ipv6", "packets")]
         if any(d.place or d.owner
@@ -44723,6 +45627,7 @@ class WebsitesTab(BaseTab):
         self.local = LocalServicesView(self, views["Local services"])
 
     def _on_subview(self, name):
+        self.local.on_subview(name == "Local services")
         if name == "Local services":
             self.local.shown()
         elif self._dirty:
@@ -45823,6 +46728,7 @@ class LocalServicesView:
                    add="+")
         bar = tk.Frame(frame, bg=WHITE, padx=12)
         bar.pack(fill="x", pady=(0, 6))
+        self.bar = bar
         self.refresh_btn = ttk.Button(
             bar, text="Refresh", command=lambda: self.reload(reprobe=True))
         self.refresh_btn.pack(side="left")
@@ -45842,8 +46748,16 @@ class LocalServicesView:
                         "(one “GET /”), only on this computer, to show its "
                         "title. Listed in “What MiniWireshark sent”; the "
                         "kill switch stops it.")
-        self.count_lbl = tk.Label(bar, text="", bg=WHITE, fg="#666666")
-        self.count_lbl.pack(side="right")
+        # fifth audit: the count sits at the right of the sub-view buttons
+        # (Websites | Local services), shown with this sub-view. In this
+        # bar it took a row of its own in French and Spanish, and at Extra
+        # large in English, a row the table needs in a short window
+        sub_bar = getattr(tab, "_sub_bar", None)
+        self._count_on_sub = sub_bar is not None
+        self.count_lbl = tk.Label(sub_bar if self._count_on_sub else bar,
+                                  text="", bg=WHITE, fg="#666666")
+        if not self._count_on_sub:
+            self.count_lbl.pack(side="right")
         # shown only when some programs couldn't be named or listed
         self.note_lbl = tk.Label(frame, text="", bg=WHITE, fg="#8a5a00",
                                  wraplength=1000, justify="left",
@@ -45854,6 +46768,11 @@ class LocalServicesView:
         self.tree.column("#0", width=self.NAME_COL[1], minwidth=120,
                          stretch=True)
         self.tree.tag_configure("kind", font=mw_font(10, "bold"))
+        # fifth audit: this table sizes its own columns (fit_names)
+        self.tree._mw_fits_itself = self.fit_names
+        self._full = {}              # iid -> the whole heading or name
+        self._fit_job = self._fit_sig = self._x0 = self._fit_set = None
+        self._detail_mode = "full"
         # the selected service in full sentences: a table cell is cut at
         # its column's width, this line wraps
         self.detail_lbl = tk.Label(
@@ -45868,6 +46787,8 @@ class LocalServicesView:
         self.tree.bind("<Return>", self._double)
         self.tree.bind("<<TreeviewSelect>>",
                        lambda e: self._sync_buttons(), add="+")
+        bind_plain(self.tree, "<Configure>", self._fit_soon)
+        bind_plain(frame, "<Configure>", self._fit_soon)
         self.kit = TableKit(
             tab, self.tree, wrap, "local_services",
             key_of=lambda iid: self._key(self.iid_row.get(iid)) or
@@ -45936,6 +46857,7 @@ class LocalServicesView:
                 self._probe_seq != self._probe_seen) and \
                 self._poll_job is None:
             self.refresh()
+        self._fit_soon()             # a text-size or window change
 
     def reload(self, reprobe=False):
         """Refresh: read the connection table again (in the background)
@@ -45993,6 +46915,7 @@ class LocalServicesView:
             return False
         self.iid_row.clear()
         self.iid_group.clear()
+        self._full.clear()
         self.kit.clear()
         pick = None
         # third audit (owner): under one heading per kind, in a fixed
@@ -46009,6 +46932,7 @@ class LocalServicesView:
             giid = tree.insert("", "end", text=text, values=(),
                                open=True, tags=("kind",))
             self.iid_group[giid] = gkey
+            self._full[giid] = text
             for r in members:
                 key = self._key(r)
                 name, cells = local_service_view_cells(r)
@@ -46018,6 +46942,7 @@ class LocalServicesView:
                                                   text=name)
                 iid = tree.insert(giid, idx, text=name, values=vals)
                 self.iid_row[iid] = r
+                self._full[iid] = name
                 self.kit.inserted(giid, iid, slot, key)
                 if key == want:
                     pick = iid
@@ -46029,8 +46954,11 @@ class LocalServicesView:
             text = translate_text(plural(len(rows), "service")) \
                 if rows else ""
             if n_net:
-                text += "  ·  " + translate_text(
-                    "%d reachable from the network") % n_net
+                # fifth audit: "1 joignable", "3 joignables", not
+                # "joignable(s)"
+                text += "  ·  " + (translate_text(
+                    "1 reachable from the network") if n_net == 1 else
+                    translate_text("%d reachable from the network") % n_net)
             self.count_lbl.configure(text=text)
             if partial:
                 self.note_lbl.configure(text=(
@@ -46043,6 +46971,8 @@ class LocalServicesView:
                 self.note_lbl.pack_forget()
         self._sync_buttons()
         self.kit.empty_soon()
+        self._fit_sig = None
+        self._fit_soon()
         return True
 
     def _start_probes(self, rows, own):
@@ -46131,7 +47061,284 @@ class LocalServicesView:
         with contextlib.suppress(tk.TclError):
             self.open_btn.configure(
                 state="normal" if r is not None and r["url"] else "disabled")
-            self.detail_lbl.configure(text=self.detail_text(r))
+        self.fit_rows()
+
+    # ---- fifth audit: whole names, and rows in a short window --------------
+    MIN_ROWS = 5            # rows the table keeps in a short window
+    NAME_SHARE = 0.45       # at most this much of the table for the names
+
+    def on_subview(self, shown):
+        """The sub-view row shows the count while Local services is shown."""
+        if not shown:
+            with contextlib.suppress(tk.TclError, AttributeError):
+                sub = self.tab._sub_bar
+                if _pack_pady(sub.pack_info()) != 6:
+                    sub.pack_configure(pady=(6, 0))
+        if not self._count_on_sub:
+            return
+        with contextlib.suppress(tk.TclError):
+            if shown and not self.count_lbl.winfo_manager():
+                self.count_lbl.pack(side="right")
+            elif not shown and self.count_lbl.winfo_manager():
+                self.count_lbl.pack_forget()
+
+    def _fit_soon(self, *_a):
+        if self._fit_job is None:
+            with contextlib.suppress(tk.TclError):
+                self._fit_job = self.tree.after_idle(self._fit_now)
+
+    def _fit_now(self):
+        self._fit_job = None
+        self.fit_names()
+        self.fit_rows()
+
+    def _fonts(self):
+        """(headings' font, names' font, the names' font spec)."""
+        head = tkfont.nametofont(mw_font(10, "bold"))
+        spec = str(ttk.Style().lookup("Treeview", "font") or
+                   "TkDefaultFont")
+        return head, Charts.font(self.tree, spec), spec
+
+    def _measure_x0(self):
+        """Where Tk starts a heading's text in the name column (after the
+        open/close arrow), measured on a row on screen; None when no row
+        shows."""
+        tree = self.tree
+        for g in tree.get_children():
+            bb = tree.bbox(g, "#0")
+            if not bb:
+                continue
+            y = bb[1] + bb[3] // 2
+            for x in range(bb[0], bb[0] + min(bb[2], px(80))):
+                if "text" in str(tree.identify_element(x, y)):
+                    return x - bb[0]
+        return None
+
+    def _text_x(self, depth):
+        try:
+            indent = float(self.tree.winfo_fpixels(
+                ttk.Style().lookup("Treeview", "indent") or 20))
+        except (tk.TclError, ValueError):
+            indent = 20.0
+        x0 = self._x0 if self._x0 is not None else px(20)
+        return int(math.ceil(x0 + depth * indent))
+
+    @staticmethod
+    def _elide(font, text, room):
+        if font.measure(text) <= room:
+            return text
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if font.measure(text[:mid].rstrip() + "…") <= room:
+                lo = mid
+            else:
+                hi = mid - 1
+        return text[:lo].rstrip() + "…"
+
+    def fit_names(self):
+        """The name column is as wide as its longest heading (with its
+        count) or service name, measured in the shown language and font;
+        the other columns give it room down to their own heading's
+        width, and it takes its share when there is more. Only when even
+        that can't give it what it needs (NAME_SHARE of the table at
+        most) are the longest texts shortened with "…". In the fifth
+        audit it stayed at 250 pixels (less after Tk squeezed it):
+        "File sharing, printing and streamin", "Partage de fichiers,
+        impression et", "Connexion à une base de donn". Runs again when
+        something else (a text-size change's fit) moved the widths.
+        → True when something changed."""
+        tree = self.tree
+        try:
+            if not tree.winfo_ismapped():
+                return False
+            avail = tree.winfo_width()
+            if avail < 100:
+                return False
+            head, body, spec = self._fonts()
+            disp = tuple(tree["displaycolumns"])
+            all_c = ("#0",) + tuple(tree["columns"])
+            sig = (avail, spec, str(head.actual()), heading_font()[1],
+                   str(heading_font()[0].actual()), self._sig, UI_SCALE[0],
+                   disp, CURRENT_LOCALE,
+                   tuple(str(tree.heading(c, "text")) for c in all_c))
+            now = tuple((int(tree.column(c, "width")),
+                         int(tree.column(c, "minwidth"))) for c in all_c)
+            if sig == self._fit_sig and now == self._fit_set:
+                return False
+            if self._x0 is None:
+                self._x0 = self._measure_x0()
+            items = []
+            for g in tree.get_children():
+                items.append((g, 0))
+                items += [(i, 1) for i in tree.get_children(g)]
+            pad = px(8)
+
+            def need(iid, depth):
+                f = head if depth == 0 else body
+                return self._text_x(depth) + f.measure(
+                    self._full.get(iid, "")) + pad
+            min0 = heading_width(str(tree.heading("#0", "text"))) + 20
+            want0 = max([min0] + [need(i, d) for i, d in items])
+            all_cols = list(tree["columns"])
+            cols = all_cols if not disp or disp[0] == "#all" else \
+                [c for c in disp if c in all_cols]
+            spec_of = {c[0]: c for c in self.COLS}
+            mins, base = {}, {}
+            for c in cols:
+                text = str(tree.heading(c, "text") or "").rstrip(" ▲▼")
+                mins[c] = max(30, heading_width(text) + 20 if text else 30)
+                base[c] = max(mins[c], int(spec_of.get(c, (c, "", 80))[2]))
+            fixed = [c for c in cols if not spec_of.get(c, ("",) * 5)[4]]
+            stretch = [c for c in cols if c not in fixed]
+            room = avail - 4 - sum(base[c] for c in fixed)
+            w0 = min(want0, max(min0, int(avail * self.NAME_SHARE)))
+            rest = room - w0
+            s_base = sum(base[c] for c in stretch)
+            s_min = sum(mins[c] for c in stretch)
+            new = {c: base[c] for c in fixed}
+            if rest >= s_base:
+                # more than enough: the names take their share too
+                extra = rest - s_base
+                weights = s_base + w0
+                for c in stretch:
+                    new[c] = base[c] + extra * base[c] // max(1, weights)
+                w0 = room - sum(new[c] for c in stretch)
+            elif rest >= s_min:
+                give = rest - s_min
+                span = max(1, s_base - s_min)
+                for c in stretch:
+                    new[c] = mins[c] + give * (base[c] - mins[c]) // span
+            else:                              # scrolls sideways
+                for c in stretch:
+                    new[c] = mins[c]
+            changed = False
+            if int(tree.column("#0", "width")) != w0:
+                tree.column("#0", width=w0, minwidth=min(w0, want0))
+                changed = True
+            for c in cols:
+                if int(tree.column(c, "width")) != new[c]:
+                    tree.column(c, width=new[c], minwidth=mins[c])
+                    changed = True
+            # what still doesn't fit is shortened with "…"
+            for iid, depth in items:
+                full = self._full.get(iid)
+                if full is None:
+                    continue
+                f = head if depth == 0 else body
+                shown = self._elide(f, full, w0 - self._text_x(depth) - pad)
+                if str(tree.item(iid, "text")) != shown:
+                    tree.item(iid, text=shown)
+                    changed = True
+            self._fit_sig = sig if self._x0 is not None else None
+            self._fit_set = tuple((int(tree.column(c, "width")),
+                                   int(tree.column(c, "minwidth")))
+                                  for c in all_c)
+            return changed
+        except (tk.TclError, ValueError, TypeError, RuntimeError):
+            return False
+
+    def _table_need(self):
+        """Pixels the table needs for its heading and MIN_ROWS rows."""
+        tree = self.tree
+        rowh = int(float(str(ttk.Style().lookup("Treeview", "rowheight")
+                             or 20)))
+        head_h = 0
+        while head_h < px(80) and str(tree.identify_region(
+                px(10), head_h)) in ("heading", "separator"):
+            head_h += 1
+        if head_h in (0, px(80)):                # not on screen yet
+            head_h = rowh + 4
+        hs = self.wrap.grid_slaves(row=1, column=0)
+        hs_h = hs[0].winfo_reqheight() if hs else 0
+        return head_h + self.MIN_ROWS * rowh + hs_h + 6
+
+    def _fit_need(self):
+        """BaseTab._fit_header: the explanation above steps aside unless
+        the table keeps MIN_ROWS rows and the line under it one line."""
+        try:
+            f = tkfont.nametofont(mw_font(9))
+            return self._table_need() + 12 + f.metrics("linespace") + 8
+        except (tk.TclError, ValueError, TypeError):
+            return None
+
+    def _compact_bars(self, short):
+        """A short window: the gaps around the table shrink, and the
+        Refresh and Open buttons take the sub-view buttons' slimmer
+        padding (sixth audit: 4 rows in Spanish on the Windows runner's
+        768-pixel screen, in French on Ubuntu 24.04's fonts)."""
+        gap = (0, 2) if short else (0, 6)
+        if _pack_pady(self.bar.pack_info()) != sum(gap):
+            self.bar.pack_configure(pady=gap)
+            self.wrap.pack_configure(pady=(0, 0 if short else 6))
+        want = "Sub.TButton" if short else "TButton"
+        for b in (self.refresh_btn, self.open_btn):
+            if (str(b.cget("style")) or "TButton") != want:
+                b.configure(style=want)
+        sub = getattr(self.tab, "_sub_bar", None)
+        if sub is not None and sub.winfo_manager() == "pack":
+            top = 2 if short else 6
+            if _pack_pady(sub.pack_info()) != top:
+                sub.pack_configure(pady=(top, 0))
+
+    def fit_rows(self):
+        """A short window (Extra large text at 1024×690): the table keeps
+        MIN_ROWS rows. The line under it then steps aside while it only
+        says "Select a service…", and holds one line (cut with "…") for
+        the selected service; it wraps in full when there is room. In the
+        fifth audit the table showed about 2 rows there."""
+        lbl = self.detail_lbl
+        r = self.selected_row()
+        text = self.detail_text(r)
+        try:
+            if not self.frame.winfo_ismapped():
+                lbl.configure(text=text)
+                return
+            need = self._table_need()
+            shown = bool(lbl.winfo_manager())
+            sub = getattr(self.tab, "_sub_bar", None)
+            short = self._detail_mode != "full"
+            if not short:
+                self._bar_full_h = self.bar.winfo_height()
+            bar_full = getattr(self, "_bar_full_h", None) or \
+                self.bar.winfo_height()
+            # the room the table, the line, the button row and the gaps
+            # share: the same whatever is shown or compact, so the choice
+            # can't go back and forth
+            pads = _pack_pady(self.wrap.pack_info()) + \
+                _pack_pady(self.bar.pack_info()) + (
+                    _pack_pady(sub.pack_info()) if sub is not None else 0)
+            total = self.wrap.winfo_height() + self.bar.winfo_height() + \
+                pads + (lbl.winfo_height() + 6 if shown else 0)
+            full_pads = 6 + 6 + (6 if sub is not None else 0)
+            f = tkfont.nametofont(mw_font(9))
+            line = f.metrics("linespace") + 2
+            width = max(100, self.frame.winfo_width() - 2 * px(12) - 8)
+            wrapw = min(width, int(float(str(lbl.cget("wraplength")) or 0))
+                        or width)
+            lines = 1
+            if r is not None:
+                lines = max(1, int(math.ceil(f.measure(text) /
+                                             max(1, wrapw))))
+            if total >= need + bar_full + full_pads + lines * line + 6:
+                mode = "full"
+            elif r is not None:
+                mode = "line"
+                text = self._elide(f, text, width)
+            else:
+                mode = "hidden"
+            self._detail_mode = mode
+            self._compact_bars(mode != "full")
+            if str(lbl.cget("text")) != text:
+                lbl.configure(text=text)
+            if mode == "hidden" and shown:
+                lbl.pack_forget()
+            elif mode != "hidden" and not shown:
+                lbl.pack(side="bottom", fill="x", pady=(0, 6),
+                         before=self.wrap)
+        except (tk.TclError, ValueError, TypeError):
+            with contextlib.suppress(tk.TclError):
+                lbl.configure(text=text)
 
     @staticmethod
     def detail_text(r):
@@ -46453,6 +47660,13 @@ class RemoteTab(BaseTab):
 class AlertsTab(BaseTab):
     name, label_key = "alerts", "tab_alerts"
     VIEW_VARS = ("q_var", "sev_var")
+    COLUMNS = [("sev", "Severity", 100, "w", False),
+               ("when", "Last seen", 80, "center", False),
+               ("reason", "What happened", 440, "w", True),
+               ("device", "Related to", 190, "w", False),
+               ("conf", "Confidence", 85, "w", False),
+               ("count", "Times", 55, "e", False),
+               ("status", "Status", 110, "w", False)]
 
     def build(self):
         top = self.header("\U0001F514  Alerts — every alert separates "
@@ -46467,7 +47681,7 @@ class AlertsTab(BaseTab):
             tk.Label(legend, text=f"{icon} {name}", bg=WHITE, fg=fg,
                      font=mw_font(9)).pack(side="left",
                                                      padx=(0, 16))
-        bar = self.toolbar()
+        bar = self.bar = self.toolbar()
         self.show_ack_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(bar, text="Show acknowledged", command=self.rebuild,
                         variable=self.show_ack_var).pack(side="left")
@@ -46512,25 +47726,22 @@ class AlertsTab(BaseTab):
         self.held_var = tk.StringVar(value="")
         self.lbl(bar, "", textvariable=self.held_var).pack(side="right",
                                                            padx=(4, 0))
+        self._slim = [inv, more]
         for label, fn in (("Acknowledge", self.acknowledge),
                           ("Details", self._details)):
-            ttk.Button(bar, text=label, command=fn).pack(side="right",
-                                                         padx=(4, 0))
+            b = ttk.Button(bar, text=label, command=fn)
+            b.pack(side="right", padx=(4, 0))
+            self._slim.append(b)
         # 5.1.2: one alert at a time, newest danger first
         self.review_btn = ttk.Button(bar, text="Review",
                                      command=self.app.review_alerts)
         self.review_btn.pack(side="right", padx=(4, 0))
+        self._slim.append(self.review_btn)
         self._review_job = None
-        wrap, self.tree = make_tree(
-            self.frame, [("sev", "Severity", 100, "w", False),
-                         ("when", "Last seen", 80, "center", False),
-                         ("reason", "What happened", 440, "w", True),
-                         ("device", "Related to", 190, "w", False),
-                         ("conf", "Confidence", 85, "w", False),
-                         ("count", "Times", 55, "e", False),
-                         ("status", "Status", 110, "w", False)],
-            selectmode="extended")
+        wrap, self.tree = make_tree(self.frame, self.COLUMNS,
+                                    selectmode="extended")
         wrap.pack(fill="both", expand=True, padx=6, pady=(0, 6))
+        self.table_wrap = wrap
         self.tree.bind("<Double-1>", self._details)
         self.tree.bind("<Return>", self._details)
         self.iids = IidMap()
@@ -46549,7 +47760,39 @@ class AlertsTab(BaseTab):
         # "AVERTISSEM"; the column fits the longest severity of every
         # language, so a language change needs no new width
         fit_cell_texts(self.tree, "sev", self.severity_texts())
+        self.apply_density(bool(getattr(self.app, "_compact", False)))
         self.on_theme()
+
+    MIN_ROWS = 3
+
+    def apply_density(self, compact):
+        """5.3.4: a short window (Extra large text at 1024×690, French
+        on Ubuntu's DejaVu fonts) left the table 2 rows under the tool
+        bar's two rows of buttons. Compact mode (MiniWireshark.
+        _apply_density) gives the bar's buttons the sub-view buttons'
+        slimmer padding and a smaller gap under the bar; nothing is
+        hidden."""
+        with contextlib.suppress(tk.TclError, AttributeError):
+            gap = (0, 2) if compact else (0, 6)
+            if _pack_pady(self.bar.pack_info()) != sum(gap):
+                self.bar.pack_configure(pady=gap)
+            for w in self._slim:
+                base = w.winfo_class()
+                want = ("Sub." + base) if compact else base
+                if (str(w.cget("style")) or base) != want:
+                    w.configure(style=want)
+
+    def _fit_need(self):
+        """BaseTab._fit_header: the explanation above steps aside unless
+        the table keeps its heading and MIN_ROWS rows (5.3.4; at least
+        the six lines any tab keeps)."""
+        try:
+            rowh = int(float(str(ttk.Style().lookup("Treeview",
+                                                    "rowheight") or 20)))
+            line = tkfont.nametofont("TkDefaultFont").metrics("linespace")
+            return max(6 * line, (self.MIN_ROWS + 1) * rowh + px(10))
+        except (tk.TclError, ValueError, TypeError):
+            return None
 
     def severity_texts(self):
         """Every Severity cell this table can show, in every language."""
@@ -47381,6 +48624,23 @@ class MapTab(BaseTab):
             else len(self.KIND_ORDER), d.display_name().lower(), d.key))
         pos, i, ring = {}, 0, 0
         n = len(order)
+        # 5.3.4: a map only a few lines tall (150 % in a 1024x768 window)
+        # has no room for a ring: its devices sat on the router, letters
+        # on letters. They stand in a row either side of the router then.
+        ui = self._ui_scale()
+        clear, gap = 28 * ui + 6, 20 * ui + 8   # router+device radii, step
+        self._row_layout = bool(n) and \
+            base_r * (0.55 if n > 14 else 0.72) < clear
+        if self._row_layout:
+            far = 0
+            for j, d in enumerate(order):
+                off = clear + (j // 2) * gap
+                pos[d.key] = (cx + (off if j % 2 == 0 else -off), cy)
+                far = max(far, off)
+            for k, (fx, fy) in saved.items():
+                if k in pos:
+                    pos[k] = (fx * w, fy * h)
+            return pos, (cx, cy), far + 10 * ui
         while i < n:
             cap = 14 + 10 * ring
             chunk = order[i:i + cap]
@@ -47408,11 +48668,16 @@ class MapTab(BaseTab):
         self._pos = pos
         X0, Y0 = self.P(cx, cy)
         R0 = radius * self.scale * 1.08
-        self.c.create_oval(X0 - R0, Y0 - R0, X0 + R0, Y0 + R0,
+        # a row of devices on a short map: a flat ring, as tall as the map
+        row = getattr(self, "_row_layout", False)
+        R0y = min(radius * 1.08, max(4, h / 2 - 2)) * self.scale \
+            if row else R0
+        self.c.create_oval(X0 - R0, Y0 - R0y, X0 + R0, Y0 + R0y,
                            outline=t["muted_fg"], dash=(4, 3),
                            tags=("deco",))
-        if radius >= 60:          # small ring: the title would sit on a node
-            tt = self.c.create_text(X0, Y0 - R0 - 12,
+        # small ring: the title would sit on a node (a row: above the map)
+        if radius >= 60 and not row:
+            tt = self.c.create_text(X0, Y0 - R0y - 12,
                                     text="YOUR LOCAL NETWORK",
                                     fill=t["muted_fg"], tags=("deco",),
                                     font=default_font(9,
@@ -47435,7 +48700,8 @@ class MapTab(BaseTab):
         me = m.my_device_key()
         sw_pos = None
         if sw and self.layer_switch.get():
-            sw_pos = (cx - radius * 0.35, cy + radius * 0.35)
+            sw_pos = (cx - radius - 14 * ui, cy) if row else \
+                (cx - radius * 0.35, cy + radius * 0.35)
         traffic = self.ov_traffic.get()
         self._list_rows = []
         for dev in devs:
@@ -49900,7 +51166,8 @@ class PacketsTab(BaseTab):
         self.quick_btn = ttk.Button(self.adv_row, text="Quick filters ▾",
                                     command=self.toggle_quick_filters)
         self.quick_btn.pack(side="left", padx=(0, 8))
-        self.lbl(self.adv_row, "Expression:").pack(side="left")
+        self.expr_lbl = self.lbl(self.adv_row, "Expression:")
+        self.expr_lbl.pack(side="left")
         self.expr_var = tk.StringVar()
         ee = ttk.Entry(self.adv_row, textvariable=self.expr_var, width=46)
         self.filter_entry = ee
@@ -49915,17 +51182,19 @@ class PacketsTab(BaseTab):
                     "Field expressions:  ip.src == 192.168.1.5    "
                     "tcp.port == 443    dns.qry.name contains \"example\"    "
                     "smtp    expert.severity >= warning    frame.len > 1000")
-        ttk.Button(self.adv_row, text="Fields…",
-                   command=self.open_fields).pack(side="left", padx=(0, 4))
-        ttk.Button(self.adv_row, text="Build…",
-                   command=self.toggle_builder).pack(side="left",
-                                                     padx=(0, 4))
+        self.fields_btn = ttk.Button(self.adv_row, text="Fields…",
+                                     command=self.open_fields)
+        self.fields_btn.pack(side="left", padx=(0, 4))
+        self.build_btn = ttk.Button(self.adv_row, text="Build…",
+                                    command=self.toggle_builder)
+        self.build_btn.pack(side="left", padx=(0, 4))
         self.builder = None
         self.suggest = FieldSuggest(self, ee)
         ttk.Button(self.adv_row, text="Apply",
                    command=self.apply).pack(side="left")
-        ttk.Button(self.adv_row, text="Clear filter",
-                   command=self.clear_filter).pack(side="left", padx=4)
+        self.clear_btn = ttk.Button(self.adv_row, text="Clear filter",
+                                    command=self.clear_filter)
+        self.clear_btn.pack(side="left", padx=4)
         self.preset_var = tk.StringVar(value=translate_text("Presets…"))
         self.preset_box = ttk.Combobox(self.adv_row, width=18,
                                        textvariable=self.preset_var,
@@ -49937,6 +51206,7 @@ class PacketsTab(BaseTab):
         pm = ttk.Button(self.adv_row, text="⋯", width=3)
         pm.configure(command=lambda b=pm: self._preset_menu(b))
         pm.pack(side="left")
+        self.preset_more = pm
         Tooltip(pm, "Save this filter as a preset, or delete the chosen "
                     "preset")
         self.err_var = DisplayVar()
@@ -49958,21 +51228,24 @@ class PacketsTab(BaseTab):
         self.pause_btn.pack(side="left")
         self.follow_var = tk.BooleanVar(
             value=app.config.get("capture.follow_newest", True))
-        ttk.Checkbutton(stat, text="Follow newest packet",
-                        variable=self.follow_var).pack(side="left",
-                                                       padx=(8, 0))
-        self.lbl(stat, "Time:").pack(side="left", padx=(12, 2))
+        self.follow_chk = ttk.Checkbutton(stat, text="Follow newest packet",
+                                          variable=self.follow_var)
+        self.follow_chk.pack(side="left", padx=(8, 0))
+        self.time_lbl = self.lbl(stat, "Time:")
+        self.time_lbl.pack(side="left", padx=(12, 2))
         self.time_var = tk.StringVar(value=app.config.get(
             "capture.time_format", "Time of day"))
         tb = ttk.Combobox(stat, textvariable=self.time_var, width=17,
                           state="readonly", values=list(TIME_FORMATS))
         tb.pack(side="left")
+        self.time_box = tb
         tb.bind("<<ComboboxSelected>>", lambda e: self._time_format())
         self.xcolor_var = tk.BooleanVar(value=app.config.get(
             "capture.color_expert", True))
-        ttk.Checkbutton(stat, text="Colour expert findings",
-                        variable=self.xcolor_var,
-                        command=self._xcolor).pack(side="left", padx=(8, 0))
+        self.xcolor_chk = ttk.Checkbutton(stat, text="Colour expert findings",
+                                          variable=self.xcolor_var,
+                                          command=self._xcolor)
+        self.xcolor_chk.pack(side="left", padx=(8, 0))
         self.ind_var = DisplayVar(value="Display filter: showing "
                                           "everything")
         tk.Label(stat, textvariable=self.ind_var, bg=WHITE, fg="#0b5394",
@@ -49980,9 +51253,22 @@ class PacketsTab(BaseTab):
         self.count_var = DisplayVar()
         tk.Label(stat, textvariable=self.count_var, bg=WHITE, fg="#666666"
                  ).pack(side="right")
-        vert = ttk.PanedWindow(self.frame, orient="vertical")
-        vert.pack(fill="both", expand=True, padx=10, pady=(4, 8))
+        # 5.3.4 (CI, a 1024x768 screen): the list and the details are
+        # packed first, from the bottom, asking for PANE_MIN pixels: they
+        # keep that room in a short window, and the rows above give way
+        # (_fit_rows; Tk squeezed the last rows packed, which was the list,
+        # to about 10 pixels or nothing). With room to spare it is laid
+        # out as before: the rows keep their height, the list takes the rest
+        vert = ttk.PanedWindow(self.frame, orient="vertical",
+                               height=px(self.PANE_MIN))
+        vert.pack(side="bottom", fill="both", expand=True, padx=10,
+                  pady=(4, 8), before=pills)
         self.vert_pane = vert
+        self._rows_level, self._rows_hidden = 0, set()
+        self._rows_job = None
+        for w in (self.frame, vert, pills, row, self.adv_row, self.err_lbl,
+                  self.means_lbl, stat):
+            bind_plain(w, "<Configure>", self._fit_rows_soon)
         lf = tk.Frame(vert, bg=WHITE)
         vert.add(lf, weight=3)
         wrap, self.tree = make_tree(
@@ -50170,6 +51456,101 @@ class PacketsTab(BaseTab):
                 extra = bars[0].winfo_reqheight() + 4
         return 4 * rowh + 2 * line + 30, head + 3 * rowh + extra + 4
 
+    PANE_MIN = 200       # the packet list and details, at the least
+
+    def _fit_rows_soon(self):
+        if getattr(self, "_rows_job", None) is None:
+            with contextlib.suppress(tk.TclError):
+                self._rows_job = self.vert_pane.after_idle(self._fit_rows)
+
+    def _fit_rows(self):
+        """5.3.4 (CI, a 1024x768 screen, the Inspector open): the filter
+        row and the row under it wrapped to seven lines and left the list
+        and the details about 10 pixels. When the list and the details
+        would have less than PANE_MIN pixels, the rows above give way:
+        first the filter row's Fields / Build / presets and the display
+        choices beside Pause (follow, time, colours) step aside, then the
+        whole Pause row, then the "Expression:" caption (the box keeps its
+        examples tip) and, while the quick filters are folded, their
+        button, then Clear filter (an emptied box and Enter clear it
+        too). They come back when there's room. When even that is not
+        enough (a smaller window, larger text) the filter rows stay whole
+        and the list and details take what is left."""
+        self._rows_job = None
+        vert = self.vert_pane
+        view = vert.master
+        stat = self.stat_row
+        try:
+            height, width = view.winfo_height(), view.winfo_width()
+            if height <= 1:
+                return                          # not laid out yet
+            back = self._rows_hidden
+            steps = [(self.fields_btn, self.build_btn, self.preset_box,
+                      self.preset_more, self.follow_chk, self.time_lbl,
+                      self.time_box, self.xcolor_chk),
+                     (stat,),
+                     (self.expr_lbl,) + (() if self.pills_frame.
+                                         winfo_manager() else
+                                         (self.quick_btn,)),
+                     (self.clear_btn,)]
+            hides = [sum(steps[:k], ()) for k in range(len(steps) + 1)]
+
+            def row_h(w, hide):
+                fl = getattr(w, "_mw_flow", None)
+                h = fl.measure(hide=hide, show=back, width=width) if fl \
+                    else w.winfo_reqheight()
+                return h + _pack_pady(w.pack_info())
+
+            def rows(level):
+                total = sum(row_h(w, hides[level])
+                            for w in view.pack_slaves()
+                            if w is not vert and w is not stat)
+                if stat not in hides[level]:
+                    # (packed or not: it steps aside as a whole)
+                    fl = getattr(stat, "_mw_flow", None)
+                    total += fl.measure(hide=hides[level], show=back,
+                                        width=width) if fl \
+                        else stat.winfo_reqheight()
+                return total
+            pad = _pack_pady(vert.pack_info())
+            need = px(self.PANE_MIN) + pad
+            last = len(steps)
+            level = next((lv for lv in range(last)
+                          if height - rows(lv) >= need), last)
+            self._rows_level = level
+            # the list and details ask for PANE_MIN, or what the rows
+            # leave when even the last step is not enough (Tk would
+            # otherwise leave the filter row out)
+            ask = px(self.PANE_MIN) if height - rows(level) >= need else \
+                max(1, height - rows(level) - pad)
+            if _int(vert.cget("height")) != ask:
+                vert.configure(height=ask)
+            if stat in hides[level] and stat.winfo_manager():
+                stat.pack_forget()
+            elif stat not in hides[level] and not stat.winfo_manager():
+                stat.pack(fill="x")             # the last row
+            # (a row Tk lays out as a plain row yet can't give way)
+            want = {w for w in hides[level] if w is not stat and
+                    getattr(w.master, "_mw_flow", None) is not None}
+            if want == back:
+                return
+            for w in want - back:
+                w.master._mw_flow.hide(w)
+            for w in back - want:
+                w.master._mw_flow.show(w)
+            self._rows_hidden = want
+        except (tk.TclError, AttributeError, ValueError, TypeError):
+            pass
+
+    def _row_before(self, *rows):
+        """pack() options that put a row above the first of `rows` that
+        is shown (the Pause row steps aside in a short window)."""
+        for w in rows:
+            with contextlib.suppress(tk.TclError):
+                if w.winfo_manager() == "pack":
+                    return {"before": w}
+        return {}
+
     def _details_room_soon(self):
         if getattr(self, "_room_job", None):
             return
@@ -50182,7 +51563,10 @@ class PacketsTab(BaseTab):
         all of the height, and a saved divider could leave less), so the
         details had to be dug out with a thin divider. The divider now
         leaves the details room whenever the window is tall
-        enough for both (four lines; three rows of packets stay)."""
+        enough for both (four lines; three rows of packets stay). It also
+        keeps the list its three rows: a window made shorter shrinks both
+        parts by their weights, and with the list and details kept 200
+        pixels on a 1024x768 screen that left the list one row."""
         self._room_job = None
         vert = self.vert_pane
         try:
@@ -50191,11 +51575,13 @@ class PacketsTab(BaseTab):
                 return
             need, keep = self.details_room()
             pos = vert.sashpos(0)
-            if total - pos >= need or total < keep + 40:
-                # too short for three rows and the details: the packet
-                # list comes first (halving it left one row on Windows)
+            if total < keep + 40:
                 return
-            vert.sashpos(0, max(keep, total - need))
+            # the details get their room when there is room for both; the
+            # packet list comes first (halving it left one row on Windows)
+            want = min(max(pos, keep), max(keep, total - need))
+            if want != pos:
+                vert.sashpos(0, want)
         except tk.TclError:
             pass
 
@@ -50230,13 +51616,15 @@ class PacketsTab(BaseTab):
             return None
         if b is None and show is not False:
             self.builder = FilterBuilder(self)
+        self._fit_rows_soon()
         return self.builder
 
     def _show_err(self):
         try:
             if self.err_var.get():
                 if not self.err_lbl.winfo_manager():
-                    self.err_lbl.pack(fill="x", padx=12, before=self.stat_row)
+                    self.err_lbl.pack(fill="x", padx=12,
+                                      **self._row_before(self.stat_row))
             elif self.err_lbl.winfo_manager():
                 self.err_lbl.pack_forget()
         except (tk.TclError, AttributeError):
@@ -50306,8 +51694,8 @@ class PacketsTab(BaseTab):
             if self.app.beginner_mode:
                 self.adv_row.pack_forget()
             else:
-                self.adv_row.pack(fill="x", pady=(4, 0),
-                                  before=self.stat_row)
+                self.adv_row.pack(fill="x", pady=(4, 0), **self._row_before(
+                    self.err_lbl, self.means_lbl, self.stat_row))
 
     def on_theme(self):
         self.rowh = self.head_h = None       # the font may have changed
@@ -50373,7 +51761,8 @@ class PacketsTab(BaseTab):
         self.means_var.set(("= " + means) if means else "")
         try:
             if means and not self.means_lbl.winfo_manager():
-                self.means_lbl.pack(fill="x", padx=12, before=self.stat_row)
+                self.means_lbl.pack(fill="x", padx=12,
+                                    **self._row_before(self.stat_row))
             elif not means and self.means_lbl.winfo_manager():
                 self.means_lbl.pack_forget()
         except (tk.TclError, AttributeError):
@@ -54211,8 +55600,10 @@ class TabStrip:
         bar.pack(fill="x")
         # one Tab stop for the whole strip (the shown tab's label, set in
         # sync()); Left / Right / Home / End move along the tabs
-        lbl = tk.Label(outer, bg=side, fg=fg, padx=7, pady=3,
-                       font=mw_font(10, "bold"), takefocus=0)
+        # (compact mode: a tab added on a short window is compact too)
+        lbl = tk.Label(outer, bg=side, fg=fg, padx=7,
+                       pady=1 if getattr(self.app, "_compact", False)
+                       else 3, font=mw_font(10, "bold"), takefocus=0)
         focus_ring(lbl)             # 5.1.2: the focus can be seen
         lbl.pack(fill="both", expand=True)
         for w in (outer, bar, lbl):
@@ -54519,6 +55910,7 @@ class MiniWireshark:
                  progress=None):
         global DATA
         self.root = root
+        install_clipboard_guard(root)     # seventh audit: every copy
         # rc.11: (text, percent) for the loading screen the window is built
         # behind; None when built directly (tests, the benchmark)
         self._progress = progress
@@ -55468,16 +56860,22 @@ class MiniWireshark:
                                          (12, 8, 12, 2))
             self.body.pack_configure(pady=(2, 2) if c else (6, 4))
             for _o, _b, lbl in self.tabstrip.tabs.values():
-                lbl.configure(pady=1 if c else 3)
+                ring_padding(lbl, pady=1 if c else 3)
             self.tabstrip.schedule()
             if self.config.get("capture.quick_filters", None) is None:
                 self.tabs["packets"].toggle_quick_filters(not c,
                                                           remember=False)
+            for tab in self.tabs.values():
+                fn = getattr(tab, "apply_density", None)
+                if fn is not None:
+                    fn(c)
         for fr in (getattr(self, "header_frame", None),
                    getattr(self, "toolbar_frame", None)):
             fl = getattr(fr, "_mw_flow", None)
             if fl is not None:
                 fl.schedule()
+        if getattr(self, "state_panel", None) is not None:
+            self._attach_state_panel()
 
     def _card_focus(self, e):
         """A card that takes the keyboard (Tab, Shift+Tab) draws a
@@ -55895,12 +57293,34 @@ class MiniWireshark:
         self.state_panel = tk.Frame(self.root, bg=t["card_bg"], padx=16,
                                     pady=8, highlightthickness=1,
                                     highlightbackground=t["border"])
-        self.state_panel.pack(fill="x", after=self.mode_banner)
+        self._attach_state_panel()
         self.state_panel.bind("<Escape>", lambda e: self.toggle_state_panel(
             False))
         self._fill_state_panel()
         with contextlib.suppress(tk.TclError):
             self.state_panel.focus_set()
+
+    def _attach_state_panel(self):
+        """5.3.4 (CI, a 1024x768 screen): the details under the state line
+        pushed the tabs down by 140 pixels, and with the message line the
+        Packets list and its details were left none. In a short window
+        (compact mode) they open over the top of the window, under the
+        line, until closed (Close, Escape, or the line again); in a tall
+        one they sit under the line as before."""
+        panel = self.state_panel
+        if panel is None:
+            return
+        with contextlib.suppress(tk.TclError):
+            if self._compact:
+                if panel.winfo_manager() == "pack":
+                    panel.pack_forget()
+                panel.place(in_=self.mode_banner, x=0, y=0, rely=1.0,
+                            relwidth=1.0, bordermode="outside")
+                panel.lift()
+            else:
+                if panel.winfo_manager() == "place":
+                    panel.place_forget()
+                panel.pack(fill="x", after=self.mode_banner)
 
     def state_panel_lines(self):
         """The details under the state line, already in your language."""
@@ -56352,6 +57772,11 @@ class MiniWireshark:
         with contextlib.suppress(tk.TclError, AttributeError):
             if not self.inspector_visible:
                 return
+            # round 8: an Inspector shown again still reported the width
+            # it had before it was hidden (314 px) until the divider was
+            # laid out, so it was left 1 pixel wide in a 1024-pixel window
+            # (F6 then could not reach it); measure after the layout
+            self.body.update_idletasks()
             total = self.body.winfo_width()
             want = min(px(Inspector.WIDTH), total // 3)
             limit = want - 20 if floor is None else min(want, floor)
@@ -57523,8 +58948,21 @@ class MiniWireshark:
             ("Warnings", lines(dg["alerts"], lambda t, sev, x:
                                f"{fmt_clock(t)}  {sev}: {x}")),
         ]
-        return DetailDialog(self, f"What changed — {period.lower()}",
-                            sections, size="700x600")
+        # round 8 (keyboard check on Windows): each click opened another
+        # window (seven at once); one is reused, like the device cards
+        title = f"What changed — {period.lower()}"
+        old = getattr(self, "_changes_dlg", None)
+        if old is not None and old.alive():
+            with contextlib.suppress(tk.TclError):
+                old.win.title(title)
+                old.set_sections(sections)
+                old.win.deiconify()
+                old.win.lift()
+                old.win.focus_force()
+                return old
+        dlg = DetailDialog(self, title, sections, size="700x600")
+        self._changes_dlg = dlg
+        return dlg
 
     # ---- Story mode (5.3.4 M7) -----------------------------------------------
     def story_period(self):
@@ -58404,8 +59842,7 @@ class MiniWireshark:
         bar.pack(fill="x", padx=12, pady=8)
 
         def copy():
-            self.root.clipboard_clear()
-            self.root.clipboard_append(mask_sensitive(text))
+            put_on_clipboard(self.root, mask_sensitive(text))
             self._set_banner("📋  Copied to the clipboard.")
         ttk.Button(bar, text="Copy", command=copy).pack(side="left")
         ttk.Button(bar, text="Open folder", command=lambda: _open_path(
@@ -59200,6 +60637,8 @@ class MiniWireshark:
         # sub-view switches: lighter than the big Accent buttons (they
         # took 40 pixels of height above every packet list)
         s.configure("Sub.TButton", padding=(10, 3))
+        # 5.3.4: the Alerts tool bar's drop-down buttons in compact mode
+        s.configure("Sub.TMenubutton", padding=(5, 2))
         s.configure("Sub.Accent.TButton", padding=(10, 3),
                     font=mw_font(10, "bold"))
         # the main notebook's tabs are drawn by TabStrip (they wrap)
@@ -59882,7 +61321,11 @@ proc ::mw_explicit_fonts {top names} {
         if self.inspector_visible:
             tgt = getattr(self.inspector, "txt", None) or \
                 getattr(self.inspector, "close_btn", None)
-            if tgt is not None:
+            try:
+                seen = tgt is not None and tgt.winfo_viewable()
+            except tk.TclError:
+                seen = False
+            if seen:                    # an Inspector with no room: skipped
                 out.append(("inspector", tgt))
         out.append(("status", self.status_lbl))
         return out
@@ -60016,7 +61459,11 @@ proc ::mw_explicit_fonts {top names} {
             vertical = str(pane.cget("orient")) == "vertical"
             total = pane.winfo_height() if vertical else pane.winfo_width()
             pos = pane.sashpos(0)
-            new = max(px(80), min(total - px(80), pos + int(delta)))
+            # each side keeps 80 px, or a quarter of a short pane (the
+            # Packets list and details get about 150 px on a 768-pixel
+            # screen: with 80 px kept each side the divider couldn't move)
+            edge = min(px(80), max(1, total // 4))
+            new = max(edge, min(total - edge, pos + int(delta)))
             pane.sashpos(0, new)
             pos = pane.sashpos(0)
         except tk.TclError:
@@ -60074,8 +61521,8 @@ proc ::mw_explicit_fonts {top names} {
         self._class_shortcuts = []
         self._bound_shortcuts, self._shortcut_cmds = [], []
         actions = {
-            "start": lambda e=None: self.start(),
-            "stop": lambda e=None: self.stop(),
+            "start": lambda e=None: self._capture_key(True, e),
+            "stop": lambda e=None: self._capture_key(False, e),
             "clear": lambda e=None: self.clear(),
             "export": lambda e=None: self._open_export_menu(),
             "find": self._focus_search,
@@ -60114,6 +61561,36 @@ proc ::mw_explicit_fonts {top names} {
                     self._bind_palette_in_fields(seq, fn)
             except tk.TclError:
                 pass
+
+    def _capture_key(self, start, event=None):
+        """Ctrl+R (Start) and Ctrl+period (Stop). (Sixth audit) They fired
+        while the focus was in a text box, and Stop stopped watching at
+        once: in a box the person types into they are left to the box,
+        and in other windows to that window (as the divider keys are),
+        and Stop asks first, as Clear does (the same setting)."""
+        if event is not None:
+            if not self._in_main(event):
+                return None
+            if _selects_words(getattr(event, "widget", None)):
+                return None
+        if start:
+            self.start()
+        elif self._confirm_stop():
+            self.stop()
+        return "break"
+
+    def _confirm_stop(self):
+        """The Stop key asks before it stops watching, unless "Ask before
+        clearing data" is off. Nothing running: nothing to ask."""
+        running = self.sniffer is not None or self._capture_starting or \
+            bool(self._restart_job)
+        if not running or \
+                not self.config.get("general.confirm_before_clear", True):
+            return True
+        return messagebox.askyesno(
+            "Stop watching?",
+            "Watching the network stops. Everything seen so far stays on "
+            "screen.\n\nStop now?", parent=self.root)
 
     def _palette_shortcut(self, event=None):
         """Ctrl+K. In a text field it opens the palette and nothing else
@@ -61226,6 +62703,8 @@ proc ::mw_explicit_fonts {top names} {
                     if gw and gw != self.model.gateway_ip:
                         self.model.set_identity(gateway_ip=gw)
                         self.model.gateway_guessed = True
+                    elif not gw:
+                        self.model.drop_unsure_gateway()
                 self._update_perf()
                 self._sync_overload_line()
                 cv = self.model.cache.version
@@ -64638,6 +66117,8 @@ proc ::mw_explicit_fonts {top names} {
         if gw:
             self.model.set_identity(gateway_ip=gw)
             self.model.gateway_guessed = True
+        else:
+            self.model.drop_unsure_gateway()
         self.root.after(1500, self._pcap_finalize, n, cancelled)
 
     def _pcap_finalize(self, n, cancelled):
@@ -66638,11 +68119,14 @@ proc ::mw_explicit_fonts {top names} {
 
     def clear_history(self, parent=None):
         if self.history is None:
+            # seventh audit (privacy): the recent filters count too
             if (os.path.exists(PATHS.history_db) or
-                    history_record_files()) and messagebox.askyesno(
-                    "Clear history", "History is off, but old history or "
-                    "saved sessions are still on this computer. Delete "
-                    "them?", parent=parent or self.root):
+                    history_record_files() or forget_seen_in_settings(
+                        _json_copy(self.config.data))) and \
+                    messagebox.askyesno(
+                    "Clear history", "History is off, but old history, "
+                    "saved sessions or recent filters are still on this "
+                    "computer. Delete them?", parent=parent or self.root):
                 remove_history_copies(PATHS.history_db, live_too=True)
                 self._wipe_packets()
                 self._forget_records()
@@ -66650,8 +68134,10 @@ proc ::mw_explicit_fonts {top names} {
         choice = messagebox.askyesnocancel(
             "Clear history", "Yes = delete ALL stored history: the "
             "history, saved packets, the last autosave, crash copies, your "
-            "device names and notes, remembered networks and the list of "
-            "programs that wait for connections.\nNo = delete only the "
+            "device names and notes, remembered networks, the list of "
+            "programs that wait for connections, recent filters, places on "
+            "the Map, the website categories you chose and alert rules for "
+            "one device or address.\nNo = delete only the "
             "selected device's history (Devices tab).",
             parent=parent or self.root)
         if choice is None:
@@ -66694,6 +68180,12 @@ proc ::mw_explicit_fonts {top names} {
         self._banner_action(None)
         self._journal_written = False
         self._journal_count = -1
+        # seventh audit (privacy): the recent filters and the other
+        # settings that name what was seen, saved now so closing the
+        # window can't write them back
+        self._forgotten_settings = forget_seen_settings(self.config)
+        with contextlib.suppress(Exception):
+            self.tabs["packets"].refresh_presets()
         gone = 0
         for path in history_record_files():
             with contextlib.suppress(OSError):
@@ -70318,29 +71810,43 @@ def publish_crash_copy(part, path, cancelled=None, lock=None):
 
 STALE_TMP_AGE = 6 * 3600
 # what MiniWireshark itself leaves when a write is cut short: the
-# temporary file of an atomic write (_tmp_name), the crash copy's part
-# and a restored session's part (5.3.4 and earlier)
-_STALE_TMP_RE = re.compile(r"\.tmp(\d+)-\d+$|"
+# temporary file of an atomic write (_tmp_name; round 6: also the history
+# backup's, with sqlite's -journal beside it), the crash copy's part, a
+# restored session's part (5.3.4 and earlier) and (round 6) the compiled
+# copy's <name>.pyc.<pid>.tmp and the history backup's temporary file of
+# 5.3.4 and earlier (a fixed name, without the writer's process id)
+_STALE_TMP_RE = re.compile(r"\.tmp(\d+)-\d+(?:-journal)?$|"
                            r"^journal\.mwsession\.json\.(\d+)\.part$|"
-                           r"^restored\.mwsession\.json\.part$")
-STALE_TMP_FOLDERS = ("", "sessions", "cache", "logs")
+                           r"^restored\.mwsession\.json\.part$|"
+                           r"\.pyc\.(\d+)\.tmp$|"
+                           r"^history\.sqlite3(?:\.v\d+)?\.bak\.tmp"
+                           r"(?:-journal)?$")
+STALE_TMP_FOLDERS = ("", "sessions", "cache", "logs",
+                     os.path.join("cache", "bytecode"))
 
 
 def sweep_stale_temp_files(folder=None, now=None, age=STALE_TMP_AGE):
     """Round 4: temporary files that an interrupted write left in the data
     folder (18 MB of session data after 25 kills) were never removed.
     Only the names MiniWireshark makes, only in its own data folder and
-    its sessions, cache and logs folders, only regular files untouched
-    for `age` seconds whose writer isn't running; a link is never
-    followed or removed. -> the removed paths."""
+    its sessions, cache, logs and compiled-copy folders, only regular
+    files untouched for `age` seconds whose writer isn't running; a link
+    is never followed or removed. Round 6: a file that names its writer's
+    process id goes at any age once that process is certainly gone, and
+    never while it runs; one written by this process, or one without an
+    id, only after `age`. -> the removed paths."""
     folder = folder or PATHS.data
     now = time.time() if now is None else now
     gone = []
     for sub in STALE_TMP_FOLDERS:
-        d = os.path.join(folder, sub) if sub else folder
+        d = folder
         try:
-            if not stat.S_ISDIR(os.lstat(d).st_mode):
-                continue                         # a link: not followed
+            # round 6: every folder on the way (cache/bytecode), not only
+            # the last, so a linked cache folder isn't gone through
+            for part in [""] + (sub.split(os.sep) if sub else []):
+                d = os.path.join(d, part) if part else d
+                if not stat.S_ISDIR(os.lstat(d).st_mode):
+                    raise NotADirectoryError(d)  # a link: not followed
             with os.scandir(d) as it:
                 entries = list(it)
         except OSError:
@@ -70353,11 +71859,14 @@ def sweep_stale_temp_files(folder=None, now=None, age=STALE_TMP_AGE):
                 st = e.stat(follow_symlinks=False)
             except OSError:
                 continue
-            if not stat.S_ISREG(st.st_mode) or now - st.st_mtime < age:
+            if not stat.S_ISREG(st.st_mode):
                 continue
-            pid = m.group(1) or m.group(2)
-            if pid and int(pid) != os.getpid() and _pid_alive(pid):
-                continue
+            pid = m.group(1) or m.group(2) or m.group(3)
+            if pid and int(pid) != os.getpid():
+                if not _pid_gone(pid):
+                    continue                     # running, or can't tell
+            elif now - st.st_mtime < age:
+                continue                         # ours, or no id: 6 hours
             with contextlib.suppress(OSError):
                 os.remove(e.path)
                 gone.append(e.path)
@@ -74600,11 +76109,14 @@ class DeepEngine:
         # 5.3.4 (S6): the deep thread (or one reader thread per worker
         # process) counts here while the analysis thread counts in offer();
         # unlocked, counts were lost (Python 3.8 stress: 7 % of "done"), so
-        # in_flight() never reached 0 and the 60 s coverage was too low
+        # in_flight() never reached 0 and the 60 s coverage was too low.
+        # Round 8 (CI): stored before they count as done, so drain() can't
+        # return while the last batch's findings are still on their way
+        # (the thread run then lacked them next to the process run)
+        self.store.add(findings, messages, txns)
         with self.cv:
             self.done += n
             self._tick(0, n, 0)
-        self.store.add(findings, messages, txns)
 
     def _tick(self, off, done, shed):
         sec = int(time.monotonic())
@@ -78464,33 +79976,84 @@ def _mutate_call_frame(rng, raw):
     return bytes(b)
 
 
-def _cpu_clock():
-    """This thread's CPU time clock, or None where there is none."""
+_CPU_CLOCK_STEP = []
+
+
+def _cpu_clock_step(clock, spin=0.2):
+    """The smallest step the clock was seen to move by, in seconds (it
+    ticks in 15.6 ms steps on Windows), or None when it never moved."""
+    steps = []
+    end = time.perf_counter() + spin
+    last = clock()
+    while time.perf_counter() < end and len(steps) < 5:
+        now = clock()
+        if now != last:
+            steps.append(now - last)
+            last = now
+    return min(steps) if steps else None
+
+
+def _cpu_clock(max_step=0.002):
+    """This thread's CPU time clock, or None where there is none or where
+    it is too coarse to time a 50 ms limit (round 6: Windows counts thread
+    time in 15.6 ms ticks, so a 60 ms frame could read as 47 ms). Without
+    it the frames are timed again on the wall clock instead."""
     clock = getattr(time, "thread_time", None)
     try:
         clock()
-        return clock
     except Exception:                                # noqa: BLE001
         return None
+    if not _CPU_CLOCK_STEP:
+        _CPU_CLOCK_STEP.append(_cpu_clock_step(clock))
+    step = _CPU_CLOCK_STEP[0]
+    if step is None or step > max_step:
+        return None
+    return clock
+
+
+def _thread_cpu_clock_any():
+    """This thread's CPU time clock at whatever resolution it has (on
+    Windows 15.6 ms ticks), or None where there is none."""
+    clock = getattr(time, "thread_time", None)
+    try:
+        clock()
+    except Exception:                                # noqa: BLE001
+        return None
+    return clock
 
 
 def call_frame_limit_check(cpu_slowest, waited, retime, limit=0.050,
-                           tries=5):
+                           tries=5, cpu=None):
     """Fifth audit: "one frame took 98 ms" failed `call decoder fuzz` once
     on a busy machine. The 50 ms limit stays; what is measured changed.
-    `cpu_slowest` is the most CPU time one frame used (None without a CPU
-    clock): over the limit fails. `waited` holds the frames whose wall
-    time was over it; each is timed again (`retime(frame)` -> seconds)
-    and fails only when it is slow every one of `tries` times, so a frame
-    the machine set aside for a while (preemption, another program) no
-    longer fails while one that is slow every time still does.
+    `cpu_slowest` is the most CPU time one frame used, on a fine CPU
+    clock (None without one, as on Windows): over the limit fails.
+    `waited` holds the frames whose wall time was over the limit. Each
+    is decoded `tries` more times (`retime(frame)` -> its wall seconds):
+    - on `cpu` (this thread's CPU clock at any resolution: Windows' 15.6
+      ms ticks over the 5 runs are within 3.2 ms a run) the CPU time it
+      used on average is over the limit: fails, however quick its wall
+      time was on some runs (round 8: a frame that is slow because of
+      its own work fails on Windows too);
+    - its wall time was over the limit every one of the `tries` times:
+      fails too (without a CPU clock, or a machine busy all along).
+    A frame that only waited once or twice (preemption, another program)
+    used little CPU time and was quick on another run: it passes. The
+    decoders give the same answer for the same bytes every time, so
+    their own cost is the same on every run.
     -> "" when all is well, else what was slow."""
     if cpu_slowest is not None and cpu_slowest >= limit:
         return f"one frame took {cpu_slowest * 1000:.0f} ms of CPU time"
     for frame in waited:
-        best = min(retime(frame) for _ in range(tries))
-        if best >= limit:
-            return (f"one frame took {best * 1000:.0f} ms each of "
+        c0 = cpu() if cpu else 0.0
+        walls = [retime(frame) for _ in range(tries)]
+        if cpu:
+            used = (cpu() - c0) / tries
+            if used >= limit:
+                return (f"one frame used {used * 1000:.0f} ms of CPU "
+                        f"time on average over {tries} runs")
+        if min(walls) >= limit:
+            return (f"one frame took {min(walls) * 1000:.0f} ms each of "
                     f"{tries} times")
     return ""
 
@@ -78550,7 +80113,8 @@ def t_call_decoder_fuzz(ctx):
     gc.disable()
     try:
         slow = call_frame_limit_check(cpu_slowest if cpu else None,
-                                      waited, retime, limit)
+                                      waited, retime, limit,
+                                      cpu=_thread_cpu_clock_any())
     finally:
         if was_on:
             gc.enable()
@@ -80417,6 +81981,419 @@ def t_a5_rogue_dhcp_first_in_file(ctx):
         a.refs.get("remote") == rogue, (a.reason, a.observed)
 
 
+# ---- sixth audit: alerts --------------------------------------------------------
+def a6_night_model(ctx, name, rip, host, mark="", tls=False, mb=30):
+    """A night upload of `mb` MB from `host` to `rip` at 3 am, after `name`
+    was looked up (or only sent in a TLS hello: `tls`); `mark`: the kind
+    you gave the device before it."""
+    sb = ScenarioBuilder(t0=a2_local_ts(10, 2, 50))
+    sb.home_network()
+    if name and tls:
+        sb.tls(host, name, rip, size=3000)
+    elif name:
+        sb.dns(host, name, rip)
+    n0 = len(sb.frames)
+    sb.t = a2_local_ts(10, 3)
+    a2_upload_frames(sb, host, rip, mb * 1024 * 1024, 12)
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    dec = fast_frame_decoder(m)
+    replay_frames(m, sb.frames[:n0], decoder=dec, tick_every=2000)
+    if mark:
+        m.device_for(host[0]).user_class = mark
+    replay_frames(m, sb.frames[n0:], decoder=dec, tick_every=2000)
+    return m
+
+
+@self_test()
+def t_a6_night_upload_call_video_nas(ctx):
+    """Sixth audit: a Zoom call at 23:10, a YouTube upload at 3 am and a
+    NAS's offsite backup were each "Large upload at night" warnings. A
+    call service or video site whose name came from a DNS answer, and a
+    device you marked as a NAS, are an INFO now, out of Unusual activity.
+    Still a WARNING: the same upload to an unknown server, to a server
+    that only claims Zoom's name in its TLS hello, mostly to an unknown
+    server, and from a device only guessed to be a NAS."""
+    S = ScenarioBuilder
+    # seventh audit: each server's address is in its provider's own
+    # ranges (YouTube's was a Zoom address, 144.195.1.2)
+    cases = (("zoomsjc144-195.sjc.zoom.us", "144.195.1.2", S.PHONE, "",
+              "Zoom", "was on a call at night (Zoom)"),
+             ("upload.youtube.com", "142.250.1.2", S.PHONE, "", "YouTube",
+              "uploaded a video at night (YouTube)"),
+             ("", "144.195.1.2", S.NAS, "NAS", "nas",
+              "(you marked it as a NAS)"))
+    for name, rip, host, mark, explained, words in cases:
+        m = a6_night_model(ctx, name, rip, host, mark)
+        got = a2_kinds(m, "night_upload")
+        assert len(got) == 1 and got[0].severity == "INFO" and \
+            got[0].refs.get("explained") == explained and \
+            words in got[0].reason, (name, [(a.severity, a.reason)
+                                            for a in got])
+        assert not unusual_findings(m.alerts), unusual_findings(m.alerts)
+        a = got[0]
+        for loc in ("fr", "es"):
+            for text in (a.reason, a.observed, a.interpretation,
+                         a.possible_explanations, a.why):
+                assert translate_text(text, loc) != text, (loc, text)
+            set_locale(loc)
+            try:
+                assert translate_event(a.reason) != a.reason, a.reason
+            finally:
+                set_locale("en")
+    # still warnings
+    warn = [a6_night_model(ctx, "upload.example.net", "93.184.215.99",
+                           S.PHONE),
+            a6_night_model(ctx, "zoomsjc144-195.sjc.zoom.us", "45.9.40.77",
+                           S.PHONE, tls=True),
+            a6_night_model(ctx, "", "85.10.1.2", S.NAS)]
+    # a call that carries a little while most goes to an unknown server
+    sb = ScenarioBuilder(t0=a2_local_ts(10, 2, 50))
+    sb.home_network()
+    sb.dns(S.PHONE, "zoomsjc144-195.sjc.zoom.us", "144.195.1.2")
+    sb.t = a2_local_ts(10, 3)
+    a2_upload_frames(sb, S.PHONE, "144.195.1.2", 5 * 1024 * 1024, 12)
+    sb.t = a2_local_ts(10, 3)
+    a2_upload_frames(sb, S.PHONE, "93.184.215.99", 25 * 1024 * 1024, 12)
+    sb.frames.sort(key=lambda f: f[1])
+    warn.append(a2_model(ctx, sb.frames))
+    nas = warn[2].device_for(S.NAS[0])
+    assert nas.device_class == "NAS" and not nas.user_class, \
+        (nas.device_class, nas.user_class)
+    for i, m in enumerate(warn):
+        got = a2_kinds(m, "night_upload")
+        assert len(got) == 1 and got[0].severity == "WARNING" and \
+            not got[0].refs.get("explained"), \
+            (i, [(a.severity, a.reason) for a in got])
+        assert "night_upload" in [f["kind"] for f in
+                                  unusual_findings(m.alerts)], i
+    # a stream download name is still a stream, not a video upload
+    assert known_bulk_service("www.youtube.com") == ("YouTube", "stream")
+
+
+def a6_login_frames(talks):
+    """One connection a list of request packets (to a different server
+    each), then an answer."""
+    sb = ScenarioBuilder()
+    sb.home_network()
+    for i, parts in enumerate(talks):
+        sb._tcp_talk(sb.ME, f"93.184.216.{10 + i}", sb.GW[1], 47000 + i, 80,
+                     [(0, p) for p in parts] +
+                     [(1, b"HTTP/1.1 200 OK\r\n\r\n")])
+    return sb.frames
+
+
+@self_test()
+def t_a6_login_page_number_and_split_method(ctx):
+    """Sixth audit: "pass=2&page=3" (a page number) was a login, also
+    split over packets and in a web address; a POST split inside its
+    method ("PO" + "ST /login …"), one byte a packet from the first, or
+    with its headers going on in the next packet raised nothing. Now the
+    page number is quiet, a password made of digits after "pass=2" is
+    still seen, the split requests are seen, and what waits for the next
+    packet holds no header value and no password."""
+    c = IP013_CANARY.encode()
+    form = (b"POST /login HTTP/1.1\r\nHost: shop.example\r\nCookie: sid=" +
+            c + b"\r\nContent-Type: application/x-www-form-urlencoded\r\n"
+            b"\r\n")
+    req = form + b"user=alex&password=" + c
+    quiet = [[form + b"pass=2&page=3"],
+             [form + b"q=1&pa", b"ss=2&page=3"],
+             [form + b"q=1&pass=12", b"&page=3"],
+             [form + b"page=3&pass=1"],
+             [b"GET /list?pass=2&page=3 HTTP/1.1\r\nHost: x\r\n\r\n"],
+             [b"PO", b"ST /list HTTP/1.1\r\nHost: x\r\n\r\nq=1"],
+             [req[:40], req[40:120].replace(b"x-www-form-urlencoded",
+                                            b"octet-stream"), b"p",
+              b"assword=" + c],
+             [b"P", b"U", b"T /x HTTP/1.1\r\n", b"Host: x\r\n\r\n", b"P"]]
+    loud = [[form + b"pass=hunter2"],
+            [form + b"q=1&pass=2", b"345678"],
+            [b"GET /a?pass=" + c + b" HTTP/1.1\r\nHost: x\r\n\r\n"],
+            [req[:2], req[2:]],
+            [req[i:i + 1] for i in range(len(req))],
+            [req[:30], req[30:]],
+            [req[:100], req[100:]],
+            [req[:3], req[3:60], req[60:115], req[115:]],
+            [form, b"P", b"assword=" + c]]
+    frames = a6_login_frames(quiet + loud)
+    decoders = [fast_frame_decoder]
+    if ctx.scapy_ok:
+        decoders.append(default_frame_decoder)
+    for mk in decoders:
+        gwip, ips, macs, nets = scenario_identity()
+        m = NetworkModel(ctx.cfg({}), gwip, ips, macs)
+        m.set_identity(local_nets=nets)
+        m.use_packet_clock = True
+        dec = mk(m)
+        for fr in frames:
+            replay_frames(m, [fr], decoder=dec)
+            kept = repr(list(m._head_wait.values())) + \
+                repr(list(m._form_wait.values()))
+            for bad in (c, b"sid", b"shop", b"alex", b"345", b"login"):
+                assert bad not in kept.encode(), (mk.__name__, bad, kept)
+        got = a2_kinds(m, "cleartext_login")
+        where = sorted(int(a.refs.get("remote").rsplit(".", 1)[1]) - 10
+                       for a in got)
+        assert where == list(range(len(quiet), len(quiet) + len(loud))), \
+            (mk.__name__, where)
+        blob = json.dumps([alert_to_dict(a) for a in m.alerts.alerts
+                           .values()])
+        assert IP013_CANARY not in blob
+    assert not form_password_field(b"&pass=2&page=3") and \
+        form_password_field(b"&pass=2345") and \
+        form_password_field(b"&pwd=2&page=3")
+    assert login_form_tail(b"q=1&pass=12", True) == b"&pass=##"
+
+
+@self_test()
+def t_a6_rogue_dhcp_first_only_dhcp(ctx):
+    """Sixth audit: a capture FILE with only DHCP in it, the rogue heard
+    first: the rogue became the gateway and the alert called it "the
+    usual one". Nothing there shows which router is real, so neither
+    becomes the gateway (one guessed earlier is dropped) and the alert
+    names both without saying which is the rogue. Once Internet traffic
+    shows the real router, it is the gateway and the alert accuses the
+    rogue."""
+    S = ScenarioBuilder
+    rogue, rmac = "192.168.1.99", "02:66:66:00:00:99"
+    sb = S(t0=SCENARIO_T0)
+    a2_dhcp_ack(sb, rogue, rmac, S.PHONE, rogue, rogue)
+    n0 = len(sb.frames)
+    sb.dhcp(S.PHONE)
+    sb.dhcp(S.TV)
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), "", ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    dec = fast_frame_decoder(m)
+    replay_frames(m, sb.frames[:n0], decoder=dec)
+    # what the window does while a file is read: the only router so far
+    assert m.infer_gateway() == rogue
+    m.set_identity(gateway_ip=rogue)
+    m.gateway_guessed = True
+    replay_frames(m, sb.frames[n0:], decoder=dec)
+    assert m.infer_gateway() == "", m.infer_gateway()
+    assert m.drop_unsure_gateway() and m.gateway_ip == "", m.gateway_ip
+    got = a2_kinds(m, "dhcp_anomaly")
+    assert got and got[-1].severity == "DANGER", got
+    a = got[-1]
+    assert "The usual one" not in a.observed and \
+        a.reason.startswith("Two devices hand out addresses") and \
+        rogue in a.reason and S.GW[0] in a.reason and \
+        a.refs.get("sure") is False, (a.reason, a.observed, a.refs)
+    for loc in ("fr", "es"):
+        for text in (a.reason, a.observed, a.interpretation,
+                     a.possible_explanations, a.why) + tuple(a.evidence):
+            assert translate_text(text, loc) != text, (loc, text)
+    # Internet traffic through the real router decides
+    sb2 = S(t0=sb.t + 5)
+    sb2.home_network()
+    for _ in range(20):
+        sb2.tls(S.PHONE, "www.example.com", "93.184.215.14", size=3000)
+    replay_frames(m, sb2.frames, decoder=dec)
+    assert m.infer_gateway() == S.GW[0], m.infer_gateway()
+    assert not m.drop_unsure_gateway()
+    a = a2_kinds(m, "dhcp_anomaly")[-1]
+    assert a.reason.endswith(rogue) and \
+        f"The usual one, {S.GW[0]}" in a.observed and \
+        a.refs.get("sure") is True, (a.reason, a.observed)
+
+
+@self_test()
+def t_a7_night_upload_forged_dns_answer(ctx):
+    """Seventh audit: a forged DNS answer that gave an attacker's address
+    the name zoom.us made a 30 MB upload there at 3 am "was on a call at
+    night (Zoom)", an INFO out of Unusual activity. A call or video upload
+    now also needs the address in the provider's own published ranges, and
+    the name from a DNS answer for that address; else it warns as before.
+    A ninth name from TLS hellos no longer counts as one from DNS."""
+    S = ScenarioBuilder
+    bad = "45.9.40.77"
+    real = (("zoom.us", "170.114.52.2", "Zoom"),
+            ("zoomsjc144-195.sjc.zoom.us", "144.195.1.2", "Zoom"),
+            ("teams.microsoft.com", "52.113.194.132", "Microsoft Teams"),
+            ("akamai.webex.com", "170.72.10.20", "Webex"),
+            ("meet.google.com", "74.125.250.10", "Google Meet"),
+            ("upload.youtube.com", "142.250.1.2", "YouTube"),
+            ("media-cdg2-1.cdn.whatsapp.net", "157.240.1.60", "WhatsApp"))
+    for name, rip, label in real:
+        m = a6_night_model(ctx, name, rip, S.PHONE)
+        got = a2_kinds(m, "night_upload")
+        assert len(got) == 1 and got[0].severity == "INFO" and \
+            got[0].refs.get("explained") == label, \
+            (name, [(a.severity, a.reason) for a in got])
+        assert not unusual_findings(m.alerts), name
+    a = got[0]
+    for loc in ("fr", "es"):
+        assert translate_text(a.why, loc) != a.why, (loc, a.why)
+    warn = [a6_night_model(ctx, name, bad, S.PHONE)
+            for name, _rip, _l in real]
+    # the provider's name for an address of another provider's
+    warn.append(a6_night_model(ctx, "upload.youtube.com", "144.195.1.2",
+                               S.PHONE))
+    # no published list of their own: as before 5.3.4
+    warn += [a6_night_model(ctx, "gateway.discord.media", "66.22.200.5",
+                            S.PHONE),
+             a6_night_model(ctx, "vimeo.com", "34.120.202.204", S.PHONE)]
+    # a Zoom address that no DNS answer gave the name (the answer named
+    # another one)
+    sb = ScenarioBuilder(t0=a2_local_ts(10, 2, 50))
+    sb.home_network()
+    sb.dns(S.PHONE, "zoom.us", "170.114.52.2")
+    sb.t = a2_local_ts(10, 3)
+    a2_upload_frames(sb, S.PHONE, "170.114.9.9", 30 * 1024 * 1024, 12)
+    warn.append(a2_model(ctx, sb.frames))
+    # eight other names in TLS hellos, then a backup service's
+    sb = ScenarioBuilder(t0=a2_local_ts(10, 2, 40))
+    sb.home_network()
+    for i in range(8):
+        sb.tls(S.PHONE, f"www.site{i}.example", bad, size=3000)
+    sb.tls(S.PHONE, "p42-content.icloud-content.com", bad, size=3000)
+    sb.t = a2_local_ts(10, 3)
+    a2_upload_frames(sb, S.PHONE, bad, 30 * 1024 * 1024, 12)
+    tm = a2_model(ctx, sb.frames)
+    assert "p42-content.icloud-content.com" in tm.ip_to_domains.get(bad, ()) \
+        and not known_bulk_service(tm.dns_names(bad)), \
+        (list(tm.ip_to_domains.get(bad, ())), tm.dns_names(bad))
+    warn.append(tm)
+    for i, m in enumerate(warn):
+        got = a2_kinds(m, "night_upload")
+        assert len(got) == 1 and got[0].severity == "WARNING" and \
+            not got[0].refs.get("explained"), \
+            (i, [(a.severity, a.reason) for a in got])
+        assert "night_upload" in [f["kind"] for f in
+                                  unusual_findings(m.alerts)], i
+    assert provider_owns_ip("Zoom", "2620:123:2000::1") and \
+        provider_owns_ip("YouTube", "::ffff:142.250.1.2") and \
+        provider_owns_ip("Skype", "52.112.0.1")
+    for label, ip in (("Zoom", "170.115.0.1"), ("Zoom", "not an address"),
+                      ("Zoom", ""), ("Discord", "66.22.200.5"),
+                      ("Vimeo", "34.120.202.204"), ("iCloud", "17.1.1.1"),
+                      ("Google Meet", "34.120.202.204")):
+        assert not provider_owns_ip(label, ip), (label, ip)
+    for _suf, label, kind in KNOWN_BULK_SERVICES:
+        if kind in ("call", "video") and label not in ("Discord", "Vimeo"):
+            assert NIGHT_PROVIDER_NETS.get(NIGHT_PROVIDER_OF.get(label)), \
+                label
+
+
+def a7_dhcp_only_model(ctx, rogue_first):
+    """A capture file with only DHCP answers in it: the router (S.GW) and
+    a second server (192.168.1.99) that names itself as the router."""
+    S = ScenarioBuilder
+    rogue, rmac = "192.168.1.99", "02:66:66:00:00:99"
+    sb = S(t0=SCENARIO_T0)
+    if rogue_first:
+        a2_dhcp_ack(sb, rogue, rmac, S.PHONE, rogue, rogue)
+    sb.dhcp(S.PHONE)
+    sb.dhcp(S.TV)
+    if not rogue_first:
+        a2_dhcp_ack(sb, rogue, rmac, S.TV, rogue, rogue)
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), "", ips, macs)
+    m.set_identity(local_nets=nets)
+    m.use_packet_clock = True
+    dec = fast_frame_decoder(m)
+    replay_frames(m, sb.frames, decoder=dec)
+    gw = m.infer_gateway()
+    if gw:
+        m.set_identity(gateway_ip=gw)
+        m.gateway_guessed = True
+    else:
+        m.drop_unsure_gateway()
+    m._classify_dirty |= set(m.registry.by_key)
+    m._classify()
+    return m, rogue, dec
+
+
+@self_test()
+def t_a7_dhcp_only_two_servers_keep_labels(ctx):
+    """Seventh audit: a capture file with two DHCP servers that name
+    different routers and no routed traffic left the gateway empty (sixth
+    audit), and the router lost its router label too. Each server that
+    names itself as the router is now Possibly a router, "not confirmed as
+    your router", whichever was heard first; neither is the gateway or
+    "Your router", and the alert still accuses neither. Once Internet
+    traffic shows the real router, it is your router again and the other
+    one loses the label."""
+    S = ScenarioBuilder
+    lab = "not confirmed as your router"
+    for rogue_first in (True, False):
+        m, rogue, dec = a7_dhcp_only_model(ctx, rogue_first)
+        assert m.gateway_ip == "" and \
+            m.dhcp_unsure_routers() == {rogue, S.GW[0]}, \
+            (rogue_first, m.gateway_ip, m.dhcp_unsure_routers())
+        for ip in (S.GW[0], rogue):
+            d = m.device_for(ip)
+            assert d is not None and d.device_class == "Router" and \
+                d.class_confidence == "Possibly" and \
+                any(lab in r for r in d.class_reasons) and \
+                m.alert_device_name(d) != "Your router" and \
+                "Your router" not in m.friendly_who(ip, d.mac), \
+                (rogue_first, ip, d and (d.device_class,
+                                         d.class_confidence,
+                                         d.class_reasons))
+            for loc in ("fr", "es"):
+                for r in d.class_reasons:
+                    assert translate_text(r, loc) != r, (loc, r)
+        a = a2_kinds(m, "dhcp_anomaly")[-1]
+        assert a.severity == "DANGER" and a.refs.get("sure") is False \
+            and "The usual one" not in a.observed, (a.reason, a.observed)
+        # Internet traffic through the real router decides
+        sb2 = S(t0=SCENARIO_T0 + 60)
+        sb2.home_network()
+        for _ in range(20):
+            sb2.tls(S.PHONE, "www.example.com", "93.184.215.14", size=3000)
+        replay_frames(m, sb2.frames, decoder=dec)
+        gw = m.infer_gateway()
+        assert gw == S.GW[0], gw
+        m.set_identity(gateway_ip=gw)
+        m._classify_dirty |= set(m.registry.by_key)
+        m._classify()
+        assert not m.dhcp_unsure_routers()
+        g, r = m.device_for(S.GW[0]), m.device_for(rogue)
+        assert g.device_class == "Router" and \
+            g.class_confidence == "Likely" and \
+            not any(lab in x for x in g.class_reasons) and \
+            m.friendly_who(S.GW[0], g.mac).endswith("Your router"), \
+            (g.device_class, g.class_reasons)
+        assert not any(lab in x for x in r.class_reasons), r.class_reasons
+    # one DHCP server: the gateway as before, no "not confirmed"
+    sb = S(t0=SCENARIO_T0)
+    sb.dhcp(S.PHONE)
+    m = a2_model(ctx, sb.frames)
+    assert m.infer_gateway() == S.GW[0] and not m.dhcp_unsure_routers()
+
+
+@self_test()
+def t_a7_night_upload_guessed_nas_says_how_to_mark(ctx):
+    """Seventh audit: a NAS you haven't marked as one still warns on its
+    first offsite backup at night (its kind is only guessed, from what it
+    says of itself), and the warning now says how to mark it so a later
+    one is only an INFO. Other devices' warnings don't say it."""
+    S = ScenarioBuilder
+    m = a6_night_model(ctx, "", "85.10.1.2", S.NAS)
+    assert m.device_for(S.NAS[0]).device_class == "NAS"
+    got = a2_kinds(m, "night_upload")
+    assert len(got) == 1 and got[0].severity == "WARNING" and \
+        "night_upload" in [f["kind"] for f in unusual_findings(m.alerts)]
+    a = got[0]
+    assert "Set device type" in a.possible_explanations and \
+        "pick NAS" in a.possible_explanations, a.possible_explanations
+    for loc in ("fr", "es"):
+        t = translate_text(a.possible_explanations, loc)
+        assert t != a.possible_explanations and "NAS" in t, (loc, t)
+    m = a6_night_model(ctx, "", "85.10.1.2", S.PHONE)
+    got = a2_kinds(m, "night_upload")
+    assert got and "Set device type" not in got[0].possible_explanations
+    m = a6_night_model(ctx, "", "85.10.1.2", S.NAS, mark="NAS")
+    got = a2_kinds(m, "night_upload")
+    assert got and got[0].severity == "INFO"
+
+
 @self_test()
 def t_a4_backup_name_from_dns_only(ctx):
     """Fourth audit: a server that puts "p42-content.icloud-content.com"
@@ -81490,6 +83467,29 @@ def t_m2_history_two_copies_and_clock(ctx):
         time.time = real_time
     assert st2.counts()["observations"] == 1, st2.counts()
     st2.stop(5)
+
+
+@self_test()
+def t_r8_settings_path_is_a_folder(ctx):
+    """Round 8 (keyboard check on Windows): with a folder where the
+    settings file should be, the banner said another program might be
+    holding the file. It now says there is a folder there, at once (no
+    retries), uses the defaults and saves nothing over the folder."""
+    path = ctx.path("cfg-is-a-folder.json")
+    os.makedirs(os.path.join(path, "inside"), exist_ok=True)
+    t0 = time.monotonic()
+    c = AppConfig(path=path)
+    took = time.monotonic() - t0
+    assert c.read_only and c.warning == SETTINGS_IS_FOLDER, c.warning
+    assert "another program" not in c.warning and "folder" in c.warning
+    assert took < 0.5, took                      # no 1-second retries
+    assert c.save() is False
+    assert os.path.isdir(os.path.join(path, "inside"))
+    assert c.get("appearance.theme") == _default_config()[
+        "appearance"]["theme"]
+    for loc in ("fr", "es"):
+        assert translate_text(SETTINGS_IS_FOLDER, loc) != \
+            SETTINGS_IS_FOLDER, loc
 
 
 @self_test()
@@ -88376,6 +90376,34 @@ def t_534_audit_text_size_judged_by_median(ctx):
 
 
 @self_test()
+def t_r8_deep_drain_waits_for_the_findings(ctx):
+    """Round 8 (CI self-test 3.12): `deep worker process and mode
+    switching` failed once with findings in the process run that the
+    thread run lacked. The deep thread counted a batch as done before it
+    stored the batch's findings, so drain() could return in between. Now
+    a drained engine holds every finding of what it analysed."""
+    rows = _deep_rows(ScenarioBuilder().home_network())
+    e = DeepEngine()
+    e.configure("Full Power", cores=1, prefer_process=False, policy="Off")
+    add = e.store.add
+
+    def slow_add(*a):
+        time.sleep(0.3)                 # a busy machine, for a moment
+        add(*a)
+    e.store.add = slow_add
+    try:
+        e._ensure_backend()
+        assert e.backend == "thread", e.last_error
+        for d in rows:
+            e.offer(d, d["no"])
+        assert e.drain(30), e.status_text()
+        got = len(e.store.findings)
+    finally:
+        e.stop()
+    assert got > 0, "drain() returned before the findings were stored"
+
+
+@self_test()
 def test_deep_worker_process_and_mode_switching(ctx):
     """A real worker process gives the same findings as the thread; and
     switching Normal ↔ Full Power 50 times during a replay leaves the
@@ -90980,8 +93008,9 @@ def t_a4_single_copy_cannot_start_a_formula(ctx):
     other single copies went to the clipboard unguarded, so a name from
     the network such as =HYPERLINK(...) became a formula when pasted
     into a spreadsheet. A single line now gets the copied row's guard;
-    a guarded row or cell is not guarded twice, and a report of several
-    lines is left as it is."""
+    a guarded row or cell is not guarded twice. (Seventh audit: a report
+    of several lines was left as it is; now each of its lines is
+    guarded, a heading's underline of = kept.)"""
     board = []
     root = types.SimpleNamespace(clipboard_clear=board.clear,
                                  clipboard_append=board.append,
@@ -90996,9 +93025,217 @@ def t_a4_single_copy_cannot_start_a_formula(ctx):
                        (safe_tsv_row(["=a", "b"]), "'=a\tb"),
                        (safe_tsv_row(["\tx"]), "'\tx"),
                        ("Report\n======\n=not a cell",
-                        "Report\n======\n=not a cell")):
+                        "Report\n======\n'=not a cell")):
         assert copy_to_clipboard(app, text) is True
         assert board == [want], (text, board)
+
+
+@self_test()
+def t_r7_every_copied_line_guarded(ctx):
+    """Seventh audit (security): a copy of several lines reached the
+    clipboard unguarded ("=1+1\\nsecond line", "Device\\n=cmd|x"). Every
+    line, and every cell of a line, now gets the guard; ordinary lines
+    and a heading's underline stay as they are. With Tk, the copies that
+    don't go through copy_to_clipboard are guarded too: Ctrl+C in a
+    read-only text, a read-only box and the other buttons of this
+    program; what you copy from a box you type into is left alone."""
+    board = []
+    root = types.SimpleNamespace(clipboard_clear=board.clear,
+                                 clipboard_append=board.append,
+                                 update_idletasks=lambda: None)
+    app = types.SimpleNamespace(root=root, _set_banner=lambda *_a: None)
+    cases = (("=1+1\nsecond line", "'=1+1\nsecond line"),
+             ("Device\n=cmd|x", "Device\n'=cmd|x"),
+             ("a\r\n+b\r-c\n@d\tx\t=y\n", "a\r\n'+b\r'-c\n'@d\tx\t'=y\n"),
+             ("Title\n=====\n\nbody -1\n  -indented\n----",
+              "Title\n=====\n\nbody -1\n  -indented\n----"),
+             ("line one\nline two", "line one\nline two"))
+    for text, want in cases:
+        assert clipboard_safe_text(text) == want, (text,
+                                                    clipboard_safe_text(text))
+        assert clipboard_safe_text(want) == want, want    # not twice
+        assert copy_to_clipboard(app, text) is True
+        assert board == [want], (text, board)
+    # (Windows CI) the Tk part runs in a child process: if Tk ends the
+    # process there, this test fails with what it said instead of the
+    # whole self-test run stopping without a word
+    if not _tk_can_draw():
+        return None
+    code = r'''
+import faulthandler, importlib.util, os, sys
+faulthandler.enable()
+sys.argv = ["x", "--bench"]
+spec = importlib.util.spec_from_file_location("mw", os.environ["MW_FILE"])
+mw = importlib.util.module_from_spec(spec)
+sys.modules["mw"] = mw
+spec.loader.exec_module(mw)
+tk, ttk = mw.tk, mw.ttk
+r = tk.Tk()
+r.withdraw()          # never shown: Tk on Windows crashed on a copy here
+print("TK", flush=True)
+assert mw.install_clipboard_guard(r) and mw.install_clipboard_guard(r)
+print("GUARD", flush=True)
+got = []
+board_now = lambda: (got.append(r.clipboard_get()), got[-1])[1]
+r.clipboard_clear()
+r.clipboard_append("=1+1\nDevice\n=cmd|x")       # tkinter's own
+assert board_now() == "'=1+1\nDevice\n'=cmd|x", got
+lab = ttk.Label(r)                                # from any widget
+lab.clipboard_clear()
+lab.clipboard_append("@SUM(2)")
+assert board_now() == "'@SUM(2)", got
+txt = tk.Text(r)
+txt.insert("1.0", "Name\n=HYPERLINK(\"http://x\")\n")
+txt.configure(state="disabled")
+txt.tag_add("sel", "1.0", "end-1c")
+mw._TK_CLIP_APPEND[0](r, "other")                 # (unguarded, to compare)
+r.tk.call("tk_textCopy", txt._w)                 # Tk's Ctrl+C
+assert board_now() == "Name\n'=HYPERLINK(\"http://x\")\n", got
+r.clipboard_clear()
+txt.event_generate("<<Copy>>")                   # Tk's own Ctrl+C
+assert board_now() == "Name\n'=HYPERLINK(\"http://x\")\n", got
+r.clipboard_clear()
+txt.event_generate("<<Cut>>")                    # Ctrl+X: read-only text
+assert board_now() == "Name\n'=HYPERLINK(\"http://x\")\n", got
+assert txt.get("1.0", "end-1c").startswith("Name"), "cut a read-only text"
+mw.make_readonly_focusable(txt)
+txt.event_generate("<Control-c>")
+assert board_now() == "Name\n'=HYPERLINK(\"http://x\")\n", got
+ro = ttk.Entry(r)
+ro.insert(0, "@SUM(1)")
+ro.state(["readonly"])
+ro.selection_range(0, "end")
+ro.event_generate("<<Copy>>")
+assert board_now() == "'@SUM(1)", got
+box = ttk.Entry(r)                   # a search box you type in
+box.insert(0, "-dns")
+box.selection_range(0, "end")
+box.event_generate("<<Copy>>")
+assert board_now() == "-dns", got
+box.clipboard_clear()
+box.clipboard_append("=typed")      # from a box you type in: as it is
+assert board_now() == "=typed", got
+ent = tk.Entry(r)                    # a classic read-only box: Ctrl+X
+ent.insert(0, "+cmd|x")
+ent.configure(state="readonly")
+ent.selection_range(0, "end")
+ent.event_generate("<<Cut>>")
+assert board_now() == "'+cmd|x", got
+mw.put_on_clipboard(r, "x\n+y")
+assert board_now() == "x\n'+y", got
+print("OK", flush=True)
+r.destroy()
+'''
+    env = dict(os.environ, MW_FILE=os.path.abspath(__file__),
+               MINIWIRESHARK_DATA=ctx.path("r7-clip-data"))
+    r = subprocess.run([sys.executable, "-I", "-c", code], env=env,
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and "OK" in r.stdout.split(), (
+        r.returncode, r.stdout[-300:], r.stderr[-1200:])
+
+
+@self_test(needs_source=True)
+def t_r7_no_copy_skips_the_guard(ctx):
+    """Seventh audit (security): every clipboard write of this file is
+    put_on_clipboard or copy_to_clipboard, both guarded (tests exempt).
+    Before, four buttons and Ctrl+C in a report wrote to the clipboard
+    themselves."""
+    with open(SCRIPT_PATH, encoding="utf-8") as f:
+        lines = f.read().split("\n")
+    bad, top = [], ""
+    for no, line in enumerate(lines, 1):
+        m = re.match(r"(?:def|class) (\w+)", line)
+        if m:
+            top = m.group(1)
+        if top.startswith(("t_", "gt_", "_gs_")) or top in (
+                "put_on_clipboard", "copy_to_clipboard",
+                "install_clipboard_guard", "_guarded_clipboard_append") or \
+                line.lstrip().startswith("#"):
+            continue
+        if re.search(r"\.clipboard_(append|clear)\(|[\"'\[{ ]clipboard\s+"
+                     r"append\b|[\"']clipboard[\"']\s*,\s*[\"']append|"
+                     r"_TK_CLIP_APPEND\[0\]\(",
+                     line):
+            bad.append(f"{top}:{no}")
+    assert not bad, "clipboard writes without the guard: " + ", ".join(bad)
+
+
+@self_test()
+def t_r7_delete_all_forgets_seen_settings(ctx):
+    """Seventh audit (privacy): after "Delete ALL history" and closing,
+    the settings file still held the recent filters
+    (ip.addr==192.168.1.77, dns.qry.name==www.example.com). They go, with
+    the other settings that name a device, address or website: alerts
+    marked expected, muted or snoozed for one device, Map places, website
+    categories you chose and a workspace's selected row; the day-old
+    backup copy is cleaned too. Your own presets, workspaces, settings
+    and the rules for a whole alert type are kept."""
+    needles = (b"192.168.1.77", b"example.com", b"aa:bb:cc:dd:ee:77")
+    cfg = ctx.cfg()
+    cfg.save()
+    soon = time.time() + 3600
+    cfg.set("filters.recent", ["ip.addr==192.168.1.77",
+                               "dns.qry.name==www.example.com"])
+    cfg.set("alerts.muted_devices", ["new_device|aa:bb:cc:dd:ee:77"])
+    cfg.set("alerts.expected", ["gateway_change|192.168.1.77",
+                                "dns_slow|*"])
+    cfg.set("alerts.snoozed", {"arp_spoof|aa:bb:cc:dd:ee:77": soon,
+                               "beacon|*": soon})
+    cfg.set("map.positions", {"net1": {"aa:bb:cc:dd:ee:77": [0.1, 0.2]}})
+    cfg.set("websites.category_overrides", {"example.com": "Social"})
+    presets = dict(cfg.get("filters.presets"))
+    presets["Mine"] = {"expr": "proto:dns"}
+    cfg.set("filters.presets", presets)
+    cfg.set("workspaces.saved", {"W": {"tab": "devices", "view": {
+        "sel": "aa:bb:cc:dd:ee:77", "sort": ["name", False]}}})
+    cfg.set("appearance.theme", "Dark")
+    cfg.save()
+    shutil.copyfile(cfg.path, cfg.path + ".bak")   # yesterday's copy
+    was_cats = dict(CATEGORY_OVERRIDES)
+    CATEGORY_OVERRIDES["example.com"] = "Social"
+    stub = types.SimpleNamespace(
+        config=cfg, known=types.SimpleNamespace(data={"k": 1}),
+        networks=types.SimpleNamespace(data={}), network_profile=None,
+        listen_watch=None, _stop_record_jobs=lambda: None,
+        clear=lambda confirmed=False: None, tabs={},
+        model=types.SimpleNamespace(baselines=types.SimpleNamespace(
+            reset=lambda: None)),
+        _keep_undo=lambda _u: None, _banner_action=lambda _a: None)
+    g = globals()
+    real = g["history_record_files"]
+    g["history_record_files"] = lambda paths=None: []   # not the test's
+    try:
+        assert forget_seen_in_settings(_json_copy(cfg.data))
+        MiniWireshark._forget_records(stub)
+        assert "example.com" not in CATEGORY_OVERRIDES
+    finally:
+        g["history_record_files"] = real
+        CATEGORY_OVERRIDES.clear()
+        CATEGORY_OVERRIDES.update(was_cats)
+    assert sorted(stub._forgotten_settings) == [
+        "alerts.expected", "alerts.muted_devices", "alerts.snoozed",
+        "filters.recent", "map.positions", "websites.category_overrides",
+        "workspaces.saved"], stub._forgotten_settings
+    cfg.save()                                    # closing the window
+    for p in (cfg.path, cfg.path + ".bak"):
+        with open(p, "rb") as f:
+            blob = f.read()
+        assert not [n for n in needles if n in blob], (p, blob[:400])
+    again = AppConfig(path=cfg.path)
+    assert again.get("filters.recent") == [] and \
+        again.get("appearance.theme") == "Dark" and \
+        again.get("filters.presets")["Mine"] == {"expr": "proto:dns"}
+    assert again.get("alerts.expected") == ["dns_slow|*"] and \
+        list(again.get("alerts.snoozed")) == ["beacon|*"]
+    w = again.get("workspaces.saved")["W"]
+    assert w["tab"] == "devices" and w["view"]["sel"] is None and \
+        w["view"]["sort"] == ["name", False], w
+    assert forget_seen_in_settings(_json_copy(again.data)) == []
+    # a backup that can't be read is deleted, not left behind
+    with open(cfg.path + ".bak", "w", encoding="utf-8") as f:
+        f.write('{"filters": {"recent": ["ip.addr==192.168.1.77"]')
+    assert forget_seen_settings(again) == []
+    assert not os.path.lexists(cfg.path + ".bak")
 
 
 @self_test()
@@ -95093,6 +97330,21 @@ def t_r7_release_rerun_records_the_released_file(ctx):
               encoding="utf-8") as f:
         versions = f.read()
     assert f"`{want}`" in versions and "| 2 |" in versions, versions
+    # round 6: a heading without a date (not released yet) gets the
+    # release's date, once; a dated heading is left as it is
+    log_path = os.path.join(repo, "CHANGELOG.md")
+    with open(log_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write("# Changelog\n\n## [9.9.9]\n\nFixes.\n\n"
+                "## [9.9.8] — 2026-10-01\n\nOlder.\n")
+    day0 = datetime.now().date().isoformat()
+    r = run(sys.executable, os.path.join(".github", "scripts",
+                                         "release_current.py"))
+    assert r.returncode == 0, (r.stdout + r.stderr)[-600:]
+    with open(log_path, encoding="utf-8") as f:
+        log = f.read()
+    days = {day0, datetime.now().date().isoformat()}    # midnight
+    assert any(f"## [9.9.9] — {d}\n\nFixes." in log for d in days), log
+    assert "## [9.9.8] — 2026-10-01\n" in log, log
 
 
 @self_test()
@@ -97888,7 +100140,9 @@ def t_r5_device_lists_capped_in_all(ctx):
     harsh looped replay (1,000 devices, new websites every loop) memory
     grew in a straight line. Flooded through the capture path, the lists
     of all devices together stay under their totals; past them the
-    devices seen longest ago let go first and your labelled ones last."""
+    devices seen longest ago let go first and your labelled ones last.
+    Round 6: the real totals (100,000 of each) are held too; the test set
+    small ones of its own, so 10**9 passed it."""
     gw, ips, macs, nets = scenario_identity()
     m = NetworkModel(ctx.cfg({}), gw, ips, macs)
     m.set_identity(local_nets=nets)
@@ -97918,7 +100172,8 @@ def t_r5_device_lists_capped_in_all(ctx):
     over = memory_over_caps(m)
     assert "websites of all devices" not in over, over
     assert "remote addresses of all devices" not in over, over
-    # which devices let go: the oldest unlabelled ones first
+    # which devices let go: the oldest unlabelled ones first (round 6: one
+    # entry at a time, so each keeps its newest few)
     m.DEVICE_SITES_TOTAL = 900
     reg = m.registry
     t = SCENARIO_T0 + 5000
@@ -97929,16 +100184,109 @@ def t_r5_device_lists_capped_in_all(ctx):
         mac = "02:00:5e:21:00:%02x" % i
         dev = DeviceRecord(key=mac, mac=mac, first_seen=t + age,
                            last_seen=t + age, last_confirmed=t + age)
-        dev.websites.update("s%d-%d.example" % (i, n) for n in range(300))
+        for n in range(300):
+            s = "s%d-%d.example" % (i, n)
+            dev.websites.add(s)
+            m.websites[s] = WebsiteRecord(domain=s, last_seen=t + age)
         reg.by_key[mac] = dev
         four.append(dev)
     four[3].alias = "Grandma's tablet"       # the oldest, but named
     m.dirty_devices.clear()
     gone = m._cap_device_lists()
     assert gone == [four[0].key, four[1].key], gone
-    assert [len(d.websites) for d in four] == [0, 0, 300, 300]
+    # 1,200 -> 810: 390 go, each device keeps its newest 810 // 8 = 101
+    assert [len(d.websites) for d in four] == [101, 109, 300, 300], \
+        [len(d.websites) for d in four]
     assert set(gone) <= m.dirty_devices          # the table is redrawn
     assert m._cap_device_lists() == []           # under the total now
+    # round 6: the real totals (100,000 of each, as the CHANGELOG says)
+    # hold too; above, the instance's own small totals were tested
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    assert "DEVICE_SITES_TOTAL" not in vars(m)
+    for i in range(260):
+        mac = "02:00:5e:22:%02x:%02x" % (i >> 8, i & 255)
+        dev = DeviceRecord(key=mac, mac=mac, first_seen=t, last_seen=t + i,
+                           last_confirmed=t)
+        dev.websites.update("w%d-%d.example" % (i, n)
+                            for n in range(m.DEVICE_SITES_KEEP))
+        dev.remote_ips.update("34.%d.%d.%d" % (i, n >> 8, n & 255)
+                              for n in range(m.DEVICE_REMOTES_KEEP))
+        m.registry.by_key[mac] = dev
+    m._cap_device_lists()
+    for attr in ("websites", "remote_ips"):
+        total = sum(len(getattr(d, attr)) for d in m.registry.by_key.values())
+        assert 0 < total <= 100000, (attr, total)
+
+
+@self_test()
+def t_r6_device_lists_evict_oldest_entries(ctx):
+    """Round 6 (memory): past the total for all devices, a device that was
+    merely quiet (a server heard every few hours) lost its WHOLE list of
+    websites and remote addresses. Now the devices seen longest ago give
+    their oldest entries first (one whose website is already forgotten,
+    then by when that device last met it), each keeps its newest few
+    while the others still have older ones to give, and a labelled device
+    gives last."""
+    gw, ips, macs, nets = scenario_identity()
+    m = NetworkModel(ctx.cfg({}), gw, ips, macs)
+    m.DEVICE_SITES_TOTAL = 900
+    m.DEVICE_REMOTES_TOTAL = 400
+    t = SCENARIO_T0 + 20000
+    reg = m.registry
+
+    def device(n, seen):
+        mac = "02:00:5e:23:00:%02x" % n
+        dev = DeviceRecord(key=mac, mac=mac, first_seen=t - 30000,
+                           last_seen=seen, last_confirmed=seen)
+        reg.by_key[mac] = dev
+        return dev
+
+    def sites(dev, fmt, times):
+        for n, ts in enumerate(times):
+            s = fmt % n
+            dev.websites.add(s)
+            w = m.websites.setdefault(s, WebsiteRecord(domain=s,
+                                                       last_seen=t))
+            w.ties[dev.key] = [AS_CONNECTED, ts, ts, 1]
+
+    quiet = device(1, t - 5000)               # heard hours ago
+    busy = device(2, t - 1)
+    fresh = device(3, t)
+    named = device(4, t - 9000)
+    named.alias = "Office server"
+    sites(quiet, "q%d.example", [t - 6000 - n for n in range(300)])
+    sites(busy, "bo%d.example", [t - 8000 - n for n in range(100)])
+    sites(busy, "bn%d.example", [t - 100 - n for n in range(200)])
+    sites(fresh, "c%d.example", [t - n * 0.1 for n in range(300)])
+    sites(named, "l%d.example", [t - 9500] * 300)
+    quiet.websites.update("gone%d.example" % n for n in range(5))  # forgotten
+    m.dirty_devices.clear()
+    gone = m._cap_device_lists()
+    # 1,205 -> 810: 395 go; each device keeps its newest 810 // 8 = 101.
+    # The quiet one gives first (the forgotten ones among its oldest)...
+    assert quiet.websites == {"q%d.example" % n for n in range(101)}, \
+        len(quiet.websites)
+    # ...then the one heard a second before the fresh one: its oldest
+    assert busy.websites == {"bn%d.example" % n for n in range(109)}, \
+        len(busy.websites)
+    assert len(fresh.websites) == 300 and len(named.websites) == 300
+    assert gone == [quiet.key, busy.key], gone
+    assert set(gone) <= m.dirty_devices and named.key not in m.dirty_devices
+    assert sum(len(d.websites) for d in reg.by_key.values()) == 810
+    # remote addresses: by when the remote host was last seen
+    for n in range(300):
+        for dev, ts in ((quiet, t - 7000 - n), (fresh, t - n)):
+            ip = "35.%d.%d.%d" % (dev is fresh, n >> 8, n & 255)
+            dev.remote_ips.add(ip)
+            m.remote_hosts[ip] = RemoteHostRecord(ip=ip, last_seen=ts)
+    m._cap_device_lists()
+    # 600 -> 360: each of the two keeps 90; the quiet one's older 210 go
+    # first, then the fresh one's oldest 30
+    assert len(quiet.remote_ips) == 90 and len(fresh.remote_ips) == 270, \
+        (len(quiet.remote_ips), len(fresh.remote_ips))
+    assert "35.0.0.0" in quiet.remote_ips and \
+        "35.1.1.43" not in fresh.remote_ips and \
+        "35.1.1.13" in fresh.remote_ips
 
 
 @self_test()
@@ -101318,6 +103666,8 @@ def _kbd_packet_row(app, ctx):
         _gui_pump(root, 0.5)
     row = pick()
     assert row is not None, (len(app.all_rows), app.data_mode)
+    if app.current_tab_name() == "packets":
+        _kbd_room(root, app.tabs["packets"].vert_pane)
     return row
 
 
@@ -101325,6 +103675,17 @@ def _kbd_packet_row(app, ctx):
                "scroll and copy by key")
 def gt_kbd_text_panes(app, ctx):
     root = app.root
+    # seventh audit (security): the window puts the clipboard guard in
+    # place as it opens, for Tk's own Ctrl+C too
+    assert getattr(root, "_mw_clip_guard", False)
+    for ev in ("<<Copy>>", "<<Cut>>"):
+        assert any(ev in str(b) for b in
+                   root.tk.splitlist(root.tk.call("bind", "all"))), \
+            f"no guard on Tk's own {ev}"
+    assert tk.Misc.clipboard_append is _guarded_clipboard_append, \
+        "tkinter's clipboard_append is not guarded"
+    for proc in ("::tk_textCopy", "::tk_textCut"):
+        assert root.tk.call("trace", "info", "execution", proc), proc
     app.toggle_inspector(True)
     ptab = app._select_tab("packets")
     ptab.show_subview("Packets")
@@ -101353,7 +103714,8 @@ def gt_kbd_text_panes(app, ctx):
     top = tk.Toplevel(root)
     try:
         txt = tk.Text(top, height=6, width=30, state="normal")
-        txt.insert("1.0", "\n".join(f"line {i}" for i in range(300)))
+        txt.insert("1.0", "\n".join(f"line {i}" for i in range(300)) +
+                   "\n=cmd|x")
         txt.configure(state="disabled")
         make_readonly_focusable(txt)
         entry = ttk.Entry(top)
@@ -101392,6 +103754,10 @@ def gt_kbd_text_panes(app, ctx):
         txt.event_generate("<Control-c>")
         _gui_pump(root, 0.1)
         assert "line 299" in root.clipboard_get()
+        # seventh audit (security): a line of the copy that could start
+        # a formula is guarded and the others are left as they are
+        assert root.clipboard_get().endswith("\nline 299\n'=cmd|x"), \
+            root.clipboard_get()[-40:]
         assert str(txt.cget("state")) == "disabled"
         entry.focus_force()
         _gui_pump(root, 0.1)
@@ -101424,7 +103790,7 @@ def gt_kbd_tables(app, ctx):
                 tree.selection_set(kids[0])
                 tree.focus(kids[0])
             # Menu key and Shift+F10 open the row menu, with Sort and columns
-            for seq in ("<Shift-F10>", "<Key-Menu>"):
+            for seq in ("<Shift-F10>", _kbd_menu_key()):
                 del shown[:]
                 tree.event_generate(seq)
                 _gui_pump(root, 0.05)
@@ -101505,6 +103871,37 @@ def gt_kbd_tables(app, ctx):
     assert rows_seen >= 4, rows_seen
 
 
+def _gt_win_keypad_enter(root, widget, tries=3):
+    """Windows: press the keypad's Enter key for real (VK_RETURN with the
+    extended-key flag, what the keypad sends) with `widget` focused.
+    -> the keysyms the widget got for it (["Return"] when all is well)."""
+    import ctypes
+    user32 = ctypes.windll.user32
+    seen = []
+    tags = widget.bindtags()
+    root.bind_class("mw_keypad", "<KeyPress>",
+                    lambda e: seen.append(e.keysym))
+    widget.bindtags(("mw_keypad",) + tuple(tags))
+    try:
+        for _i in range(tries):
+            root.deiconify()
+            root.lift()
+            user32.SetForegroundWindow(int(root.wm_frame(), 16))
+            widget.focus_force()
+            _gui_pump(root, 0.2)
+            user32.keybd_event(0x0D, 0x1C, 0x1, 0)          # extended
+            user32.keybd_event(0x0D, 0x1C, 0x1 | 0x2, 0)    # key up
+            end = time.monotonic() + 2.0
+            while not seen and time.monotonic() < end:
+                _gui_pump(root, 0.05)
+            if seen:
+                break
+    finally:
+        widget.bindtags(tags)
+        root.unbind_class("mw_keypad", "<KeyPress>")
+    return seen
+
+
 @gui_test_step("keyboard B: Enter opens the selected row like a "
                "double-click")
 def gt_kbd_enter_opens(app, ctx):
@@ -101524,8 +103921,16 @@ def gt_kbd_enter_opens(app, ctx):
         _gui_pump(root, 0.1)
         by_key = list(calls)
         del calls[:]
-        tree.event_generate("<KP_Enter>")
-        _gui_pump(root, 0.1)
+        if root.tk.call("tk", "windowingsystem") == "win32":
+            # Tk on Windows has no KP_Enter keysym (tkWinKey.c maps
+            # VK_RETURN to Return, with or without the keypad's
+            # extended-key flag), so a generated KP_Enter reaches nothing
+            # there; the real keypad key is pressed instead
+            keys = _gt_win_keypad_enter(root, tree)
+            assert keys == ["Return"], ("the keypad Enter", keys)
+        else:
+            tree.event_generate("<KP_Enter>")
+            _gui_pump(root, 0.1)
         assert calls == by_key, (calls, by_key)
         return by_key
     try:
@@ -101600,7 +104005,9 @@ def gt_kbd_enter_opens(app, ctx):
             _gui_pump(root, 0.1)
             assert calls and calls[0][0] == "connector_dialog", calls
         finally:
-            st.tree.delete(iid)
+            # the Sources table's own refresh may have rebuilt it already
+            if st.tree.exists(iid):
+                st.tree.delete(iid)
         # Packets: Enter moves the keyboard to the packet's fields
         pt = app._select_tab("packets")
         pt.show_subview("Packets")
@@ -101628,7 +104035,7 @@ def gt_kbd_context_keys(app, ctx):
         _gui_pump(root, 0.4)
         pt.tree.focus_force()
         _gui_pump(root, 0.1)
-        for seq in ("<Shift-F10>", "<Key-Menu>"):
+        for seq in ("<Shift-F10>", _kbd_menu_key()):
             del shown[:]
             pt.tree.event_generate(seq)
             _gui_pump(root, 0.05)
@@ -101663,7 +104070,7 @@ def gt_kbd_context_keys(app, ctx):
         pt.dtree.selection_set(kids[0])
         pt.dtree.focus(kids[0])
         _gui_pump(root, 0.1)
-        for seq in ("<Shift-F10>", "<Key-Menu>"):
+        for seq in ("<Shift-F10>", _kbd_menu_key()):
             del shown[:]
             pt.dtree.event_generate(seq)
             _gui_pump(root, 0.05)
@@ -101679,7 +104086,7 @@ def gt_kbd_context_keys(app, ctx):
         if mp.nodes:
             mp.c.focus_force()
             _gui_pump(root, 0.1)
-            for seq in ("<Shift-F10>", "<Key-Menu>"):
+            for seq in ("<Shift-F10>", _kbd_menu_key()):
                 del shown[:]
                 mp.c.event_generate(seq)
                 _gui_pump(root, 0.05)
@@ -101695,7 +104102,7 @@ def gt_kbd_context_keys(app, ctx):
             assert str(c.cget("takefocus")) == "1"
             c.focus_force()
             _gui_pump(root, 0.1)
-            for seq in ("<Shift-F10>", "<Key-Menu>"):
+            for seq in ("<Shift-F10>", _kbd_menu_key()):
                 del shown[:]
                 c.event_generate(seq)
                 _gui_pump(root, 0.05)
@@ -102523,6 +104930,7 @@ def gt_m8_access(app, ctx):
     found = []
     try:
         apply_ui_scale(root, "150 %")
+        # as big as the screen allows (Tk holds it to a 1024x768 screen)
         root.geometry(px_geo("1366x768"))
         app._apply_text_size(defer=False)
         _gui_pump(root, 0.8)
@@ -102531,6 +104939,23 @@ def gt_m8_access(app, ctx):
             _gui_pump(root, 0.6)
             found += [(name,) + x for x in layout_audit(root)
                       if x[0] in ("canvas-text-overlap", "overlap")]
+        # 5.3.4: the Map in the window a 1024x768 screen gives, on any
+        # screen: a map a few lines tall had its devices on the router
+        # ("H × R"; with other fonts the circles only, letters apart)
+        root.geometry("1024x768")
+        _gui_pump(root, 0.8)
+        found += [("map 1024x768",) + x for x in layout_audit(root)
+                  if x[0] in ("canvas-text-overlap", "overlap")]
+        mc, rs = app.tabs["map"].c, []
+        for i in mc.find_withtag("node"):
+            if mc.type(i) == "oval" and mc.winfo_ismapped():
+                x1, y1, x2, y2 = mc.coords(i)
+                rs.append(((x1 + x2) / 2, (y1 + y2) / 2, (x2 - x1) / 2,
+                           mc.gettags(i)[0]))
+        found += [("map 1024x768", "nodes-overlap", a[3], b[3])
+                  for k, a in enumerate(rs) for b in rs[k + 1:]
+                  if math.hypot(a[0] - b[0], a[1] - b[1]) <
+                  a[2] + b[2] - 2]
     finally:
         root.tk.call("tk", "scaling", sc0)
         UI_SCALE[0] = old
@@ -104410,6 +106835,321 @@ def gt_534_local_services(app, ctx):
     assert tab.subview == "Websites"
 
 
+def _ls_listeners_all():
+    """Demo Mode's services and the test fixture's together: headings and
+    names of every length (Local services, fifth audit)."""
+    out = dict(_local_fake_listeners())
+    out.update(DEMO_LOCAL_LISTENERS)
+    out[("TCP", "0.0.0.0", 445)] = (4, "System")
+    out[("TCP", "0.0.0.0", 3389)] = (11, "svchost.exe")
+    return out
+
+
+def _ls_name_cuts(view):
+    """Headings and service names of the Local services table whose text
+    doesn't show whole in its column: [(text shown, why)]. Measured on
+    the table itself: where Tk starts the text (its element under the
+    pointer) plus the text's width in the row's font, against the
+    column's right edge."""
+    tree = view.tree
+    out = []
+    body = tkfont.Font(font=ttk.Style().lookup("Treeview", "font") or
+                       "TkDefaultFont")
+    head = tkfont.nametofont(str(tree.tag_configure("kind", "font")))
+    kinds = dict(LOCAL_KINDS)
+    tree.xview_moveto(0)
+    rel = None                  # the text's start inside its cell
+    for g in tree.get_children():
+        kids = tuple(tree.get_children(g))
+        for iid in (g,) + kids:
+            if iid == g:
+                full = "%s (%d)" % (translate_text(
+                    kinds[view.iid_group[g][1]]), len(kids))
+            else:
+                full = local_service_view_cells(view.iid_row[iid])[0]
+            shown = str(tree.item(iid, "text"))
+            tree.see(iid)
+            tree.update()
+            bb = tree.bbox(iid, "#0")
+            if not bb:
+                out.append((shown, "not on screen"))
+                continue
+            y = bb[1] + bb[3] // 2
+            if rel is None and y < tree.winfo_height():
+                x = bb[0]
+                while x < bb[0] + bb[2] and \
+                        "text" not in str(tree.identify_element(x, y)):
+                    x += 1
+                if x < bb[0] + bb[2]:
+                    rel = x - bb[0]
+            if rel is None:
+                out.append((shown, "no text found in the cell"))
+                continue
+            x = bb[0] + rel
+            need = (head if iid == g else body).measure(shown)
+            if full not in shown:
+                out.append((shown, "shortened, full: " + full))
+            elif x + need > bb[0] + bb[2]:
+                out.append((shown, "cut: text %d px from %d, column ends "
+                            "at %d" % (need, x, bb[0] + bb[2])))
+    return out
+
+
+def _ls_rows_shown(view):
+    """How many rows (headings included) of the table show whole."""
+    tree = view.tree
+    tree.yview_moveto(0)
+    tree.update_idletasks()
+    h = tree.winfo_height()
+    n = 0
+    for g in tree.get_children():
+        for iid in (g,) + tuple(tree.get_children(g)):
+            bb = tree.bbox(iid)
+            if bb and bb[1] + bb[3] <= h:
+                n += 1
+    return n
+
+
+@gui_test_step("fifth audit: Local services shows every heading and name "
+               "whole at 1280×800 (EN, FR, ES), at least 5 rows at "
+               "1024×690 Extra large, and counts in proper words")
+def gt_r5_local_services_fit(app, ctx):
+    root = app.root
+    tab = app._select_tab("websites")
+    view = tab.local
+    src0 = view.source
+    fake = {"listening": _ls_listeners_all()}
+    view.source = lambda: ("ok", dict(fake["listening"]))
+    old = (app.config.get("general.language"),
+           app.config.get("appearance.text_size"), root.geometry())
+
+    def setup(lang, size, geo):
+        app.config.set("general.language", lang)
+        app.config.set("appearance.text_size", size)
+        app._apply_runtime_settings()
+        app._apply_text_size(defer=False)
+        root.geometry(geo)
+        _gui_pump(root, 0.5, until=lambda: not getattr(
+            app, "_theme_pending", False), timeout=10)
+        app._select_tab("websites")
+        tab.show_subview("Local services")
+        # (a tip line of an earlier step: one line under the header, as
+        # in the fifth audit's pictures, is the capture's own)
+        app._hide_banner()
+        view.reload()
+        _gui_pump(root, 0.6)
+    try:
+        problems = []
+        for lang in ("English", "Français", "Español"):
+            setup(lang, "Normal", "1280x800")
+            assert view.tree.winfo_ismapped(), lang
+            problems += [(lang,) + p for p in _ls_name_cuts(view)]
+            # whole words for the count: "joignables", not "joignable(s)"
+            assert "(s)" not in str(view.count_lbl.cget("text")), \
+                (lang, view.count_lbl.cget("text"))
+        assert not problems, problems[:8]
+        few = []
+        for lang in ("English", "Français", "Español"):
+            setup(lang, "Extra large", "1024x690")
+            n = _ls_rows_shown(view)
+            if n < 5:
+                few.append((lang, n))
+        assert not few, f"rows shown at 1024×690 Extra large: {few}"
+        # one service reachable from the network: singular in each language
+        fake["listening"] = {("TCP", "0.0.0.0", 8080): (4002, "python3"),
+                             ("TCP", "127.0.0.1", 631): (88, "cupsd")}
+        for lang, want in (("English", "1 reachable from the network"),
+                           ("Français", "1 joignable depuis le réseau"),
+                           ("Español", "1 accesible desde la red")):
+            setup(lang, "Normal", "1280x800")
+            text = str(view.count_lbl.cget("text"))
+            assert text.endswith(want), (lang, text)
+        fake["listening"] = _ls_listeners_all()
+        setup("Français", "Normal", "1280x800")
+        assert str(view.count_lbl.cget("text")).endswith(
+            "joignables depuis le réseau"), view.count_lbl.cget("text")
+    finally:
+        view.source = src0
+        app.config.set("general.language", old[0])
+        app.config.set("appearance.text_size", old[1])
+        app._apply_runtime_settings()
+        app._apply_text_size(defer=False)
+        root.geometry(old[2])
+        _gui_pump(root, 0.4, until=lambda: not getattr(
+            app, "_theme_pending", False), timeout=10)
+        tab.show_subview("Websites")
+        view.reload()
+        _gui_pump(root, 0.2)
+
+
+@gui_test_step("sixth audit: a tab that had the keyboard keeps compact "
+               "mode's padding (and its focus ring)")
+def gt_r6_tab_ring_keeps_compact(app, ctx):
+    root = app.root
+    ts = app.tabstrip
+    compact0 = bool(app._compact)
+    focus0 = root.focus_get()
+    labs = [ts.tabs[t][2] for t in ts.order]
+    a, b, c = labs[0], labs[1], labs[2]
+
+    def pady(w):
+        return int(str(w.cget("pady")))
+
+    def ring(w):
+        return int(str(w.cget("highlightthickness")))
+    try:
+        app._apply_density(True)                  # a short window
+        _gui_pump(root, 0.2)
+        assert pady(c) == 1, pady(c)
+        a.focus_force()
+        _gui_pump(root, 0.2)
+        assert ring(a) > 0, "no focus ring on the tab"
+        b.focus_force()                           # the keyboard moves on
+        _gui_pump(root, 0.2)
+        # it took back the padding it had when it was made (3), 4 pixels
+        # more than the other tabs on every row
+        assert ring(a) == 0 and pady(a) == 1, (ring(a), pady(a))
+        assert a.winfo_reqheight() == c.winfo_reqheight(), (
+            a.winfo_reqheight(), c.winfo_reqheight())
+        # the window grows while a tab has the keyboard, then shrinks
+        app._apply_density(False)
+        _gui_pump(root, 0.2)
+        assert ring(b) > 0 and pady(b) == 1 and pady(a) == 3, (
+            ring(b), pady(b), pady(a))
+        app._apply_density(True)
+        _gui_pump(root, 0.2)
+        a.focus_force()
+        _gui_pump(root, 0.2)
+        assert ring(b) == 0 and pady(b) == 1, (ring(b), pady(b))
+        assert b.winfo_reqheight() == c.winfo_reqheight()
+    finally:
+        app._apply_density(compact0)
+        with contextlib.suppress(tk.TclError, AttributeError):
+            (focus0 or root).focus_force()
+        _gui_pump(root, 0.2)
+
+
+@gui_test_step("sixth audit: Local services on a short window: the Refresh "
+               "row and the gaps get slimmer, and come back in full on a "
+               "tall window and on Websites")
+def gt_r6_local_services_slim_bars(app, ctx):
+    root = app.root
+    tab = app._select_tab("websites")
+    view = tab.local
+    sub = tab._sub_bar
+    src0 = view.source
+    view.source = lambda: ("ok", _ls_listeners_all())
+    old = (app.config.get("general.language"),
+           app.config.get("appearance.text_size"), root.geometry(),
+           root.minsize())
+
+    def setup(size, geo):
+        app.config.set("appearance.text_size", size)
+        app._apply_text_size(defer=False)
+        root.geometry(geo)
+        _gui_pump(root, 0.5, until=lambda: not getattr(
+            app, "_theme_pending", False), timeout=10)
+        app._select_tab("websites")
+        tab.show_subview("Local services")
+        app._hide_banner()
+        view.reload()
+        _gui_pump(root, 0.6)
+
+    def setup_short():
+        """Extra large on a short window, made shorter until the view is
+        short: on Windows (smaller fonts) 1024x690 still had room for
+        everything."""
+        for geo in ("1024x690", "1024x620", "1024x560", "1024x500"):
+            setup("Extra large", geo)
+            if view._detail_mode != "full":
+                return
+
+    def above_table():
+        """Pixels from the top of the sub-view row to the table."""
+        return view.wrap.winfo_rooty() - sub.winfo_rooty() + \
+            _pack_pady(sub.pack_info())
+    try:
+        app.config.set("general.language", "Español")
+        app._apply_runtime_settings()
+        setup("Normal", "1280x800")
+        assert view._detail_mode == "full", view._detail_mode
+        tall = (above_table(), view.refresh_btn.winfo_height())
+        assert _pack_pady(sub.pack_info()) == 6, sub.pack_info()
+        root.minsize(400, 300)
+        setup_short()
+        assert view._detail_mode != "full", view._detail_mode
+        # the Refresh row no taller than the sub-view buttons' row, and
+        # 2-pixel gaps: 10 pixels more for the table in Spanish
+        bh = max(view.refresh_btn.winfo_height(),
+                 view.open_btn.winfo_height())
+        sh = max(b.winfo_height() for b in sub.winfo_children()
+                 if b.winfo_class() == "TButton")
+        assert bh <= sh, (bh, sh)
+        assert _pack_pady(sub.pack_info()) == 2, sub.pack_info()
+        assert _pack_pady(view.bar.pack_info()) == 2, view.bar.pack_info()
+        # back on a tall window: the full buttons and gaps
+        setup("Normal", "1280x800")
+        assert view._detail_mode == "full", view._detail_mode
+        assert (above_table(), view.refresh_btn.winfo_height()) == tall, (
+            above_table(), view.refresh_btn.winfo_height(), tall)
+        # Websites keeps its own gap under the sub-view row
+        setup_short()
+        tab.show_subview("Websites")
+        _gui_pump(root, 0.3)
+        assert _pack_pady(sub.pack_info()) == 6, sub.pack_info()
+    finally:
+        view.source = src0
+        app.config.set("general.language", old[0])
+        app.config.set("appearance.text_size", old[1])
+        app._apply_runtime_settings()
+        app._apply_text_size(defer=False)
+        root.minsize(*old[3])
+        root.geometry(old[2])
+        _gui_pump(root, 0.4, until=lambda: not getattr(
+            app, "_theme_pending", False), timeout=10)
+        tab.show_subview("Websites")
+        view.reload()
+        _gui_pump(root, 0.2)
+
+
+@gui_test_step("fifth audit: Devices shows one evidence column by default "
+               "(Device evidence); Evidence can still be shown")
+def gt_r5_devices_one_evidence_column(app, ctx):
+    root = app.root
+    dt = app.tabs["devices"]
+    app._select_tab("devices")
+    kit = dt.kit
+    mode = app.mode_ui_var.get()
+    try:
+        for ui in ("Advanced", "Beginner"):
+            app.mode_ui_var.set(ui)
+            app._on_ui_mode_change()
+            kit.reset_columns()
+            _gui_pump(root, 0.3)
+            shown = list(dt.tree["displaycolumns"])
+            assert "conf" in shown, (ui, shown)
+            assert "evidence" not in shown, (ui, shown)
+            # the column is still offered under Columns, not shown
+            cols = next(it[1] for it in kit.header_items()
+                        if it and it[0] == "Columns")
+            ev = [c for c in cols if c[0] == translate_text("Evidence")]
+            assert ev and ev[0][3] is False, (ui, [c[0] for c in cols])
+            ev[0][1]()
+            dt.rebuild()
+            _gui_pump(root, 0.3)
+            assert "evidence" in list(dt.tree["displaycolumns"]), ui
+            assert str(dt.tree.heading("evidence", "text")).startswith(
+                translate_text("Evidence")), ui
+            kit.reset_columns()
+            _gui_pump(root, 0.2)
+            assert "evidence" not in list(dt.tree["displaycolumns"]), ui
+    finally:
+        app.mode_ui_var.set(mode)
+        app._on_ui_mode_change()
+        kit.reset_columns()
+        _gui_pump(root, 0.2)
+
+
 @gui_test_step("audit2 Local services in Demo Mode: made-up services, the "
                "real table never read, nothing opened, no light blocks in "
                "Dark")
@@ -104521,17 +107261,23 @@ def gt_r6_inspector_and_saved_widths(app, ctx):
         if kt is None or tr is None or str(tr.cget("xscrollcommand")):
             continue
         cols = [c for c in tr["columns"]]
+        # a column an earlier step narrowed (a 1024-pixel screen) counts
+        # with the width it gets back, kept in _mw_w0
+        w0 = getattr(tr, "_mw_w0", None) or {}
         if any(int(tr.column(c, "stretch")) for c in cols) and \
-                sum(int(tr.column(c, "width")) for c in cols
+                sum(int(w0.get(c) or tr.column(c, "width")) for c in cols
                     if not int(tr.column(c, "stretch"))) > 500:
             name = nm
             break
     assert name, "no table that shares its width"
     tab = app._select_tab(name)
     tree, kit = tab.tree, tab.kit
-    min0 = root.minsize()
+    min0, max0 = root.minsize(), root.maxsize()
     try:
         root.minsize(400, 300)
+        # (a 1024x768 screen) Tk holds a window to the screen unless its
+        # maximum size allows more: "full" has to be the full width
+        root.maxsize(4000, 3000)
         root.geometry("1920x1080")
         _gui_pump(root, 0.6)
         fixed = [c for c in tree["displaycolumns"]
@@ -104555,6 +107301,7 @@ def gt_r6_inspector_and_saved_widths(app, ctx):
             ({c: saved.get(c) for c in fixed}, full)
     finally:
         root.minsize(*min0)
+        root.maxsize(*max0)
         root.geometry(geo0)
         _gui_pump(root, 0.4)
 
@@ -106035,6 +108782,10 @@ def gt_r8_long_run_fast_time(app, ctx):
     gc.collect()
     base = (threading.active_count(), len(os.listdir("/proc/self/task")),
             len(os.listdir("/proc/self/fd")))
+    # a tooltip open under the pointer (2 widgets) is not the jobs' own
+    with contextlib.suppress(tk.TclError, AttributeError):
+        if Tooltip._active is not None:
+            Tooltip._active._hide()
     census0, blocks0 = _tk_census(root), sys.getallocatedblocks()
     peak = Counter()
     peak_total = 0
@@ -106131,6 +108882,9 @@ def gt_r8_long_run_fast_time(app, ctx):
     _gui_pump(root, 0.3)
     end = (threading.active_count(), len(os.listdir("/proc/self/task")),
            len(os.listdir("/proc/self/fd")))
+    with contextlib.suppress(tk.TclError, AttributeError):
+        if Tooltip._active is not None:
+            Tooltip._active._hide()
     census1, blocks1 = _tk_census(root), sys.getallocatedblocks()
     left = [t.name for t in threading.enumerate()
             if t.name in LONG_RUN_JOBS + ("fake-sniffer",)]
@@ -106624,6 +109378,7 @@ def gt_c534_settings(app, ctx):
                "cards show the keyboard focus")
 def gt_c534_palette_focus(app, ctx):
     root = app.root
+    panel0 = app.state_panel is not None
     p = app.open_palette()
     try:
         p.q.set("happening")
@@ -106653,6 +109408,9 @@ def gt_c534_palette_focus(app, ctx):
         assert not p.alive(), "a click away left Ctrl+K open"
     finally:
         p.close()
+        # the click on the mode line also opened the panel under it:
+        # closed again, so later steps see the window as it was
+        app.toggle_state_panel(panel0)
     # Tab into a drop-down list or a number box draws a ring
     st = ttk.Style()
     ring = st.lookup("TCheckbutton", "focuscolor")
@@ -107555,6 +110313,39 @@ def gt_c12_packet_view(app, ctx):
     pt.show_subview("Packets")
 
 
+@gui_test_step("5.3.4: the packet list keeps three rows when its pane grows "
+               "(a panel above it closes) with the divider near the top")
+def gt_534_packets_list_keeps_rows(app, ctx):
+    root = app.root
+    pt = app.tabs["packets"]
+    vert = pt.vert_pane
+    geo, max0 = root.geometry(), root.maxsize()
+    root.maxsize(px(4000), px(3000))     # a 768-px screen: truly 1000 high
+    try:
+        app._select_tab("packets")
+        pt.show_subview("Packets")
+        root.geometry(px_geo("1024x760"))
+        _gui_pump(root, 0.8)
+        # the divider where a shorter pane left it: the list one row
+        _need, keep = pt.details_room()
+        vert.sashpos(0, max(10, keep // 3))
+        _gui_pump(root, 0.3)
+        # the pane grows (in the full run: the panel under the mode line
+        # closed); the room for both now: the list gets its rows back
+        root.geometry(px_geo("1024x1000"))
+        _gui_pump(root, 1.0)
+        total, pos = vert.winfo_height(), vert.sashpos(0)
+        need, keep = pt.details_room()
+        assert total >= need + keep, (total, need, keep)
+        assert pos >= keep - 2 and total - pos >= need - 2, \
+            (total, pos, need, keep)
+        assert pt._nslots() >= 3, (total, pos, keep, pt._nslots())
+    finally:
+        root.maxsize(*max0)
+        root.geometry(geo)
+        _gui_pump(root, 0.4)
+
+
 @gui_test_step("5.3.4 crowd #13: the network sheet previews cleanly, has a "
                "Print button, says demo, and saving starts outside the "
                "program folder")
@@ -108067,7 +110858,12 @@ def t_r4_stale_temp_files_swept(ctx):
     session data after 25 kills) are removed at start: only the names
     MiniWireshark makes, only in its own data folder and its sessions,
     cache and logs folders, only when untouched for 6 hours and their
-    writer isn't running, never through or of a link."""
+    writer isn't running, never through or of a link.
+    Round 6: also the history backup's temporary file (and sqlite's
+    -journal beside it) and the compiled copy's .pyc.<pid>.tmp, which
+    were missed; and a file whose writer's process is gone goes at any
+    age (a crash copy cut short stayed 6 hours), while one whose writer
+    still runs is never removed."""
     d = ctx.path(f"r4_sweep_{uuid.uuid4().hex[:6]}")
     outside = ctx.path(f"r4_outside_{uuid.uuid4().hex[:6]}")
     for sub in ("sessions", "logs", "packets"):
@@ -108083,19 +110879,37 @@ def t_r4_stale_temp_files_swept(ctx):
                           f".tmp{gone_pid}-7"),
              os.path.join(d, "sessions", "restored.mwsession.json.part"),
              os.path.join(d, f"config.json.tmp{gone_pid}-1"),
-             os.path.join(d, "logs", f"x.json.tmp{gone_pid}-2")]
+             os.path.join(d, "logs", f"x.json.tmp{gone_pid}-2"),
+             # round 6: the history backup, now and as 5.3.4 named it
+             os.path.join(d, f"history.sqlite3.bak.tmp{gone_pid}-9"),
+             os.path.join(d, f"history.sqlite3.bak.tmp{gone_pid}-9-journal"),
+             os.path.join(d, "history.sqlite3.bak.tmp"),
+             os.path.join(d, "history.sqlite3.v3.bak.tmp-journal")]
+    young = [os.path.join(d, "sessions", f"autosave.mwsession.json.tmp"
+                          f"{gone_pid}-3"),      # recent, but its writer
+             os.path.join(d, "sessions", f"journal.mwsession.json."  # gone
+                          f"{gone_pid}.part"),
+             os.path.join(d, "sessions", f"journal.mwsession.json.sha256"
+                          f".tmp{gone_pid}-11")]
+    stale = stale[:1] + stale[2:]         # the .part is a young one now
+    alive = os.getppid()
     kept = [os.path.join(d, "sessions", f"autosave.mwsession.json.tmp"
-                         f"{gone_pid}-3"),               # too recent
-            os.path.join(d, f"networks.json.tmp{os.getppid()}-4"),  # alive
+                         f"{os.getpid()}-3"),     # ours, and too recent
+            os.path.join(d, f"networks.json.tmp{alive}-4"),  # alive
+            os.path.join(d, "history.sqlite3.v2.bak.tmp"),   # no id: recent
+            os.path.join(d, "sessions", f"autosave.mwsession.json.tmp"
+                         f"{alive}-4"),           # alive, recent
+            os.path.join(d, f"history.sqlite3.bak.tmp{alive}-9"),
             os.path.join(d, "sessions", "my notes.tmp"),
             os.path.join(d, "geo.mmdb.part"),        # a download resumes
             os.path.join(d, "packets", f"seg-1.pcap.tmp{gone_pid}-5"),
             os.path.join(d, "sessions", "journal.mwsession.json"),
             os.path.join(outside, f"a.json.tmp{gone_pid}-6")]
-    for p_ in stale + kept:
+    recent = set(young + kept[:1] + kept[2:4])
+    for p_ in stale + young + kept:
         with open(p_, "w", encoding="utf-8") as f:
             f.write("{}")
-        if p_ != kept[0]:
+        if p_ not in recent:
             os.utime(p_, (old, old))
     links = []
     if hasattr(os, "symlink") and not IS_WINDOWS:
@@ -108107,12 +110921,66 @@ def t_r4_stale_temp_files_swept(ctx):
         os.symlink(victim, links[0])
         os.symlink(outside, os.path.join(d, "cache"))  # a linked folder
         kept.append(victim)
+        # nor through it into the compiled-copy folder inside
+        os.makedirs(os.path.join(outside, "bytecode"))
+        kept.append(os.path.join(outside, "bytecode",
+                                 f"m.cpython-312.pyc.{gone_pid}.tmp"))
+        with open(kept[-1], "w", encoding="utf-8") as f:
+            f.write("{}")
+        os.utime(kept[-1], (old, old))
     gone = sweep_stale_temp_files(d)
-    assert sorted(gone) == sorted(stale), (gone, stale)
+    assert sorted(gone) == sorted(stale + young), (gone, stale + young)
     left = [p_ for p_ in kept + links if not os.path.lexists(p_)]
     assert not left, left
-    assert not any(os.path.exists(p_) for p_ in stale)
+    assert not any(os.path.exists(p_) for p_ in stale + young)
     assert sweep_stale_temp_files(os.path.join(d, "no-such")) == []
+    # the compiled copy (keep_compiled_copy writes <it>.<pid>.tmp first)
+    # is where the sweep looks
+    assert os.path.dirname(compiled_copy_path()) == os.path.join(
+        PATHS.data, "cache", "bytecode")
+    d2 = ctx.path(f"r6_sweep_{uuid.uuid4().hex[:6]}")
+    bc = os.path.join(d2, "cache", "bytecode")
+    os.makedirs(bc)
+    pyc = os.path.basename(compiled_copy_path())
+    swept = [os.path.join(bc, f"{pyc}.{gone_pid}.tmp"),
+             os.path.join(bc, f"x-0123456789ab.cpython-38.pyc.{gone_pid}"
+                          f".tmp")]
+    stays = [os.path.join(bc, f"{pyc}.{alive}.tmp"), os.path.join(bc, pyc)]
+    for p_ in swept + stays:
+        with open(p_, "w", encoding="utf-8") as f:
+            f.write("{}")
+    os.utime(swept[0], (old, old))
+    os.utime(stays[0], (old, old))
+    assert sorted(sweep_stale_temp_files(d2)) == sorted(swept)
+    assert all(os.path.exists(p_) for p_ in stays)
+    # the nightly history backup, cut short, names its writer now
+    import sqlite3
+
+    class CutShort:
+        def backup(self, dst):
+            dst.execute("CREATE TABLE t(x)")
+            raise sqlite3.Error("cut short")
+    hist = os.path.join(d2, "history.sqlite3")
+    Store._backup_if_due(types.SimpleNamespace(path=hist), CutShort())
+    left = [f_ for f_ in os.listdir(d2) if f_.startswith("history")]
+    assert len(left) == 1 and _STALE_TMP_RE.search(left[0]) and \
+        _STALE_TMP_RE.search(left[0]).group(1) == str(os.getpid()), left
+    assert sweep_stale_temp_files(d2) == []        # ours, and recent
+    # gone only when certain
+    assert _pid_gone(gone_pid) and not _pid_gone(alive) and \
+        not _pid_gone(os.getpid()) and not _pid_gone("x") and \
+        not _pid_gone(0)
+    if not IS_WINDOWS:          # the system can't tell: the file stays
+        import unittest.mock
+        doubt = os.path.join(bc, f"{pyc}.{gone_pid}.tmp")
+        with open(doubt, "w", encoding="utf-8") as f:
+            f.write("{}")
+        os.utime(doubt, (old, old))
+        with unittest.mock.patch.object(os, "kill",
+                                        side_effect=OSError(5, "I/O")):
+            assert not _pid_gone(gone_pid)
+            assert sweep_stale_temp_files(d2) == []
+        assert os.path.exists(doubt)
 
 
 @self_test()
@@ -108212,7 +111080,15 @@ def gt_a2_delete_all_history_leaves_nothing(app, ctx):
     # the step sees only what Delete ALL leaves behind.
     app.procmap.refresh = lambda *a, **k: None
     app._proc_seen = app.procmap.seq
+    # seventh audit (privacy): the recent filters in the settings file
+    seen_keys = ("filters.recent", "alerts.muted_devices")
+    seen_was = {k: app.config.get(k) for k in seen_keys}
     try:
+        app.config.set("filters.recent", [f"ip.addr=={ip}",
+                                          f"dns.qry.name=={site}"])
+        app.config.set("alerts.muted_devices", [f"new_device|{ip}"])
+        app.config.save()
+        app.tabs["packets"].refresh_presets()
         app.data_mode = "live"
         app.write_journal()
         with open(PATHS.journal, encoding="utf-8") as f:
@@ -108223,6 +111099,15 @@ def gt_a2_delete_all_history_leaves_nothing(app, ctx):
         assert len(asked) == 1, asked
         left = [p for p in planted if os.path.exists(p)]
         assert not left, left
+        app._remember_window()                   # what closing saves
+        for p in (app.config.path, app.config.path + ".bak"):
+            with contextlib.suppress(FileNotFoundError), \
+                    open(p, "rb") as f:
+                blob = f.read()
+                assert site.encode() not in blob and \
+                    ip.encode() not in blob, (p, site, ip)
+        assert not [v for v in app.tabs["packets"].preset_box.cget(
+            "values") if ip in str(v) or site in str(v)]
         # third audit #1: the next journal tick writes nothing old
         assert not app.model.has_data() and app._clear_undo is None
         app.data_mode = "live"
@@ -108256,6 +111141,8 @@ def gt_a2_delete_all_history_leaves_nothing(app, ctx):
         messagebox.askyesno, messagebox.askyesnocancel = real
         with contextlib.suppress(AttributeError):
             del app.procmap.refresh
+        for k, v in seen_was.items():
+            app.config.set(k, v)
         (app.known.data, app.networks.data, app.network_profile,
          app.history) = keep
         app.replace_model(was[0])
@@ -109018,19 +111905,80 @@ def t_r5_call_frame_limit_survives_a_busy_machine(ctx):
     slow = call_frame_limit_check(0.150, [], lambda f: 0.0)
     assert "150 ms of CPU time" in slow, slow
     assert call_frame_limit_check(None, [b"f"], once_slow) == ""
-    # the CPU clock sees work, not waiting
-    cpu = _cpu_clock()
+    # round 8: a frame quick on the wall on some runs but busy with its
+    # own work fails, on any CPU clock (Windows: 15.6 ms ticks)
+    fake = {"t": 0.0}
+
+    def busy_clock():
+        return fake["t"]
+
+    def busy_once_slow(frame):
+        fake["t"] += 0.080                     # 80 ms of CPU a run
+        return once_slow(frame)
+    calls["n"] = 0
+    slow = call_frame_limit_check(None, [b"f"], busy_once_slow,
+                                  cpu=busy_clock)
+    assert "80 ms of CPU time on average over 5 runs" in slow, slow
+
+    def idle_once_slow(frame):
+        fake["t"] += 0.001
+        return once_slow(frame)
+    calls["n"] = 0
+    assert call_frame_limit_check(None, [b"f"], idle_once_slow,
+                                  cpu=busy_clock) == ""
+    any_cpu = _thread_cpu_clock_any()
+    if any_cpu is not None:
+        # the real clock, coarse or fine: 60 ms of work a run, reported
+        # as quick on the wall, still fails
+        def real_work(frame):
+            c0 = any_cpu()
+            end = time.perf_counter() + 5.0
+            while any_cpu() - c0 < 0.06 and time.perf_counter() < end:
+                pass
+            return 0.001
+        slow = call_frame_limit_check(None, [b"f"], real_work, tries=3,
+                                      cpu=any_cpu)
+        assert "of CPU time on average over 3 runs" in slow, slow
+        assert call_frame_limit_check(None, [b"f"], lambda f: (
+            time.sleep(0.02), 0.001)[1], tries=3, cpu=any_cpu) == ""
+    # the CPU clock sees work, not waiting (round 8: on Windows too, on
+    # its coarse clock; the limits below are 3 of its 15.6 ms ticks away)
+    cpu = any_cpu
     if cpu is None:
         return "skip"
     c0 = cpu()
     time.sleep(0.15)
     waited = cpu() - c0
+    # (CI windows 3.12: 150 ms of wall time got 47 ms of CPU time on a
+    # busy runner) work until the CPU clock has counted 60 ms, at most 5 s
     c0 = cpu()
-    end = time.perf_counter() + 0.15
-    while time.perf_counter() < end:
+    end = time.perf_counter() + 5.0
+    while cpu() - c0 < 0.06 and time.perf_counter() < end:
         pass
     worked = cpu() - c0
     assert waited < 0.05 <= worked, (waited, worked)
+
+
+@self_test()
+def t_r6_coarse_cpu_clock_not_used(ctx):
+    """Round 6: on Windows the thread CPU clock moves in 15.6 ms ticks,
+    too coarse for the 50 ms frame limit; such a clock is not used (the
+    frames are timed again on the wall clock), a fine one is."""
+    ticks = iter(range(0, 10 ** 6))
+    coarse = lambda: next(ticks) // 1000 * 0.0156   # noqa: E731
+    step = _cpu_clock_step(coarse)
+    assert step is not None and abs(step - 0.0156) < 1e-9, step
+    assert _cpu_clock_step(lambda: 1.0, spin=0.02) is None
+    fine = time.perf_counter
+    assert _cpu_clock_step(fine) < 0.002
+    keep = list(_CPU_CLOCK_STEP)
+    try:
+        _CPU_CLOCK_STEP[:] = [0.0156]
+        assert _cpu_clock() is None
+        _CPU_CLOCK_STEP[:] = [0.000001]
+        assert _cpu_clock() is getattr(time, "thread_time", None)
+    finally:
+        _CPU_CLOCK_STEP[:] = keep
 
 
 @self_test(slow=True, needs_source=True)
@@ -109847,6 +112795,8 @@ def t_kbd_shortcut_names_have_controls_actions_and_no_clash(ctx):
 def t_kbd_roving_group_is_one_tab_stop(ctx):
     """RovingGroup: one member is the Tab stop; a disabled one is passed
     over; arrows walk the row. (A bare Tk window: no application.)"""
+    if not _tk_can_draw():
+        return "skip"           # the test machine's Python 3.8 Tk
     root = tk.Tk()
     try:
         root.withdraw()
@@ -109926,14 +112876,52 @@ def t_kbd_saved_key_equal_to_a_new_default(ctx):
     assert "clear" not in shortcut_default_losers(d)
 
 
-def _kbd_mid_sash(pane):
+def _kbd_menu_key():
+    """The Menu (Apps) key as this Tk names it: <Key-App> on Windows,
+    <Key-Menu> on X11 (CI windows: a generated <Key-Menu> reached no
+    binding there)."""
+    root = tk._default_root
+    win = root is not None and root.tk.call("tk", "windowingsystem") == \
+        "win32"
+    return "<Key-App>" if win else "<Key-Menu>"
+
+
+def _kbd_room(root, pane, need=None):
+    """(CI windows, a 768-pixel screen) with the GUI test's banners and
+    filter rows the Packets list and details got about 10 pixels, so
+    neither the divider keys nor the packet's fields could be reached.
+    The window was made taller for the step; the window itself now keeps
+    them the room (PacketsTab._fit_rows, App._attach_state_panel), and
+    this checks that it does."""
+    need = need or px(200)
+
+    def have():
+        try:
+            # an unmapped pane (pack gave it no room: the rows above it
+            # took the whole height) keeps its last, stale height
+            return pane.winfo_height() if pane.winfo_ismapped() else 0
+        except tk.TclError:
+            return 0
+    _gui_pump(root, 0.1, lambda: have() >= need, timeout=3)
+    got = have()
+    assert got >= need, (
+        f"the Packets list and details have {got} of the {need} pixels "
+        f"they need (shown: {bool(pane.winfo_ismapped())}; window "
+        f"{root.winfo_width()}x{root.winfo_height()} on a "
+        f"{root.winfo_screenwidth()}x{root.winfo_screenheight()} screen)")
+
+
+def _kbd_mid_sash(root, pane):
     """Put a divider half way before a keyboard move is measured: a step
     run after a smaller window found the Packets divider already at its
-    limit (80 px above the bottom), so a move down had no room."""
+    limit, so a move down had no room (and on a 768-pixel screen the
+    Inspector's divider started past its limit)."""
     with contextlib.suppress(tk.TclError):
+        vertical = str(pane.cget("orient")) == "vertical"
+        if vertical:
+            _kbd_room(root, pane)
         pane.update_idletasks()
-        size = pane.winfo_height() if str(pane.cget("orient")) == \
-            "vertical" else pane.winfo_width()
+        size = pane.winfo_height() if vertical else pane.winfo_width()
         pane.sashpos(0, size // 2)
         pane.update_idletasks()
 
@@ -109947,6 +112935,87 @@ def _kbd_press(root, widget, seq, pump=0.08):
     w = root.focus_get() or widget or root
     w.event_generate(seq)
     _gui_pump(root, pump)
+
+
+@gui_test_step("round 8: What changed opens one window, reused on each "
+               "click (like the device cards)")
+def gt_r8_what_changed_one_window(app, ctx):
+    """Round 8 (keyboard check on Windows): each click on the Dashboard's
+    What changed card opened another "What changed — last hour" window,
+    seven at once. One window is reused, showing the period asked for."""
+    root = app.root
+
+    def windows():
+        out = []
+        for w in root.winfo_children():
+            with contextlib.suppress(tk.TclError):
+                if isinstance(w, tk.Toplevel) and w.winfo_exists() and \
+                        str(w.title()).startswith(
+                            translate_text("What changed")[:6]):
+                    out.append(w)
+        return out
+    for w in windows():
+        w.destroy()
+    try:
+        first = app.open_changes("Last hour")
+        _gui_pump(root, 0.2)
+        for _ in range(3):
+            again = app.open_changes("Last hour")
+            _gui_pump(root, 0.1)
+            assert again is first, "a new window for the same click"
+        day = app.open_changes("Last 24 hours")
+        _gui_pump(root, 0.2)
+        assert day is first
+        assert len(windows()) == 1, [w.title() for w in windows()]
+        assert "24" in first.win.title(), first.win.title()
+        first.win.destroy()
+        _gui_pump(root, 0.1)
+        fresh = app.open_changes("Last hour")
+        assert fresh is not first and fresh.alive()
+        assert len(windows()) == 1
+    finally:
+        for w in windows():
+            w.destroy()
+        _gui_pump(root, 0.1)
+
+
+@gui_test_step("round 8: the Inspector opened in a 1024-pixel window gets "
+               "its own width, and F6 reaches it")
+def gt_r8_inspector_opens_wide_enough(app, ctx):
+    """Round 8: opened again in a 1024x768 window, the Inspector was left
+    1 pixel wide (it measured its old width before the layout), so it
+    showed nothing and F6 stopped on the table."""
+    root = app.root
+    keep = (root.geometry(), root.maxsize(), app.inspector_visible,
+            getattr(app, "_insp_auto_hidden", False),
+            getattr(app, "_body_w_prev", None))
+    try:
+        root.maxsize(4000, 3000)
+        root.geometry("1024x768")
+        _gui_pump(root, 0.8)
+        app._select_tab("devices")
+        app.toggle_inspector(False, remember=False)
+        _gui_pump(root, 0.4)
+        app.toggle_inspector(True, remember=False)
+        _gui_pump(root, 0.6)
+        total = app.body.winfo_width()
+        want = min(px(Inspector.WIDTH), total // 3)
+        got = app.inspector.frame.winfo_width()
+        assert got >= want - 20, (got, want, total, app.body.sashpos(0))
+        assert "inspector" in [n for n, _w in app._regions()]
+        table = app._table_target(app.tabs["devices"])
+        table.focus_force()
+        _gui_pump(root, 0.1)
+        _kbd_press(root, None, "<F6>")
+        assert app._region_of(root.focus_get()) == "inspector", \
+            root.focus_get()
+    finally:
+        root.maxsize(*keep[1])
+        root.geometry(keep[0])
+        _gui_pump(root, 0.5)
+        app.toggle_inspector(keep[2], remember=False)
+        app._insp_auto_hidden, app._body_w_prev = keep[3], keep[4]
+        _gui_pump(root, 0.3)
 
 
 @gui_test_step("kbd C1: F6 / Shift+F6 visit search, tabs, filter, table, "
@@ -110188,6 +113257,121 @@ def gt_kbd_status_widgets(app, ctx):
         _gui_pump(root, 0.3)
 
 
+@gui_test_step("kbd room: Packets at 1024x768 keeps the list and details "
+               "200 pixels (three packet rows) under the state panel, the "
+               "message line, a typed filter's line and an open Inspector; "
+               "the rows come back in a tall window")
+def gt_kbd_packets_room_768(app, ctx):
+    """5.3.4 CI (the Windows runner's 1024x768 screen): with the details
+    under the state line, the message line and the Inspector open (the
+    divider steps put it at half the window) the filter rows wrapped and
+    the Packets list and details had about 10 pixels, or none."""
+    root = app.root
+    pt = app.tabs["packets"]
+    vert = pt.vert_pane
+    keep = (root.geometry(), root.maxsize(), app.inspector_visible,
+            app.current_tab_name())
+    need = px(200)
+
+    def room():
+        _gui_pump(root, 0.5)
+        _gui_pump(root, 0.1, lambda: vert.winfo_ismapped() and
+                  vert.winfo_height() >= need, timeout=3)
+        return (vert.winfo_ismapped(), vert.winfo_height())
+
+    def fields_btn():
+        return next(w for w in pt.adv_row.winfo_children()
+                    if w.winfo_class() == "TButton" and
+                    str(w.cget("text")) == translate_text("Fields…"))
+    try:
+        # Tk holds a window to the screen unless its maximum size allows
+        # more (a 1024x768 screen, and a window placed at +20+30)
+        root.maxsize(px(4000), px(3000))
+        app._select_tab("packets")
+        pt.show_subview("Packets")
+        app.toggle_state_panel(True)
+        app._set_banner("A message with an action stays up", "warn",
+                        action=("Undo", lambda: None))
+        pt.expr_var.set("tcp.port == 443")
+        pt._validate_expr()                  # its "= ..." line under it
+        # from a tall window with the divider half way: made shorter, the
+        # list and the details shrink by their weights
+        root.geometry(px_geo("1400x900"))
+        _gui_pump(root, 0.6)
+        vert.sashpos(0, vert.winfo_height() // 2)
+        for geo in ("1024x768", "1009x738"):
+            root.geometry(geo)
+            _gui_pump(root, 0.6)
+            # below 1180 pixels the Inspector steps aside by itself; the
+            # divider steps open it again and put it half way
+            for half in (False, True):
+                app.toggle_inspector(True, remember=False)
+                _gui_pump(root, 0.4)
+                if half:
+                    app.body.sashpos(0, app.body.winfo_width() // 2)
+                else:
+                    app._inspector_width()
+                shown, h = room()
+                where = (geo, "Inspector at half" if half else "Inspector",
+                         f"window {root.winfo_width()}x"
+                         f"{root.winfo_height()}", f"tab "
+                         f"{vert.master.winfo_width()}x"
+                         f"{vert.master.winfo_height()}")
+                assert shown and h >= need, \
+                    ("the Packets list and details", h, "of", need,
+                     "shown" if shown else "not shown") + where
+                assert pt.expr_entry.winfo_ismapped(), \
+                    ("no filter box",) + where
+                # the list keeps three rows (the details take the rest)
+                assert pt._nslots() >= 3, ("packet rows", pt._nslots(),
+                                           vert.sashpos(0)) + where
+                assert app.state_panel is not None, where
+        # a tall window: the rows come back, the details sit under the line
+        app.toggle_state_panel(False)
+        app._banner_action(None)
+        app._hide_banner()
+        pt.expr_var.set("")
+        pt._validate_expr()
+        root.geometry(px_geo("1400x900"))
+        app.toggle_inspector(False, remember=False)
+        _gui_pump(root, 0.8)
+        _gui_pump(root, 0.1, lambda: fields_btn().winfo_ismapped(),
+                  timeout=3)
+        assert fields_btn().winfo_ismapped(), "Fields… stayed hidden"
+        assert pt.time_var.get() and any(
+            w.winfo_ismapped() for w in pt.stat_row.winfo_children()
+            if w.winfo_class() == "TCombobox"), "the Time choice stayed hidden"
+        app.toggle_state_panel(True)
+        _gui_pump(root, 0.3)
+        assert app.state_panel.winfo_manager() == "pack", \
+            app.state_panel.winfo_manager()
+        app.toggle_state_panel(False)
+        # the divider a third of the way down in the tall window, then the
+        # window made 1024x768: both parts shrink by their weights, and
+        # the list kept one row while the details had plenty
+        _gui_pump(root, 0.3)
+        vert.sashpos(0, int(vert.winfo_height() * 0.35))
+        root.geometry("1024x768")
+        _gui_pump(root, 0.8)
+        total = vert.winfo_height()
+        _need, list_room = pt.details_room()
+        if total >= list_room + 40:
+            assert pt._nslots() >= 3, ("packet rows after the window was "
+                                       "made shorter", pt._nslots(), total,
+                                       vert.sashpos(0), list_room)
+    finally:
+        app.toggle_state_panel(False)
+        app._banner_action(None)
+        app._hide_banner()
+        pt.expr_var.set("")
+        pt._validate_expr()
+        root.geometry(keep[0])
+        root.maxsize(*keep[1])
+        app.toggle_inspector(keep[2], remember=False)
+        app._select_tab(keep[3])
+        _gui_pump(root, 0.4)
+
+
 @gui_test_step("kbd C7: F7 table, F8 view, F5 refresh, Shift+F1 sheet, "
                "Ctrl+Shift+arrows dividers")
 def gt_kbd_f_keys_and_dividers(app, ctx):
@@ -110237,6 +113421,7 @@ def gt_kbd_f_keys_and_dividers(app, ctx):
         app.toggle_inspector(True, remember=False)
         _gui_pump(root, 0.6)
         body = app.body
+        _kbd_mid_sash(root, body)
         p0 = body.sashpos(0)
         lbl = app.tabstrip.selected_label()
         _kbd_press(root, lbl, "<Control-Shift-Left>")
@@ -110248,8 +113433,9 @@ def gt_kbd_f_keys_and_dividers(app, ctx):
         assert body.sashpos(0) > p1, "moved while typing in a text box"
         # the Packets list | details divider
         pt = app._select_tab("packets")
+        pt.show_subview("Packets")      # an earlier step may leave another
         _gui_pump(root, 0.6)
-        _kbd_mid_sash(pt.vert_pane)
+        _kbd_mid_sash(root, pt.vert_pane)
         v0 = pt.vert_pane.sashpos(0)
         _kbd_press(root, app.tabstrip.selected_label(),
                    "<Control-Shift-Down>")
@@ -110317,6 +113503,7 @@ def gt_kbd_fix_dividers_and_palette_key(app, ctx):
         tab = app.tabs["devices"]
         table = app._table_target(tab)
         body = app.body
+        _kbd_mid_sash(root, body)
         p0 = body.sashpos(0)
         _kbd_press(root, table, "<Control-Shift-Left>")
         p1 = body.sashpos(0)
@@ -110332,8 +113519,9 @@ def gt_kbd_fix_dividers_and_palette_key(app, ctx):
         # Packets: Ctrl+Shift+Up / Down with the list focused move the
         # divider and leave the selection where it was
         pt = app._select_tab("packets")
+        pt.show_subview("Packets")      # an earlier step may leave another
         _gui_pump(root, 0.6)
-        _kbd_mid_sash(pt.vert_pane)
+        _kbd_mid_sash(root, pt.vert_pane)
         v0, sel = pt.vert_pane.sashpos(0), pt.sel_no
         _kbd_press(root, pt.tree, "<Control-Shift-Down>")
         v1 = pt.vert_pane.sashpos(0)
@@ -110345,6 +113533,7 @@ def gt_kbd_fix_dividers_and_palette_key(app, ctx):
         assert str(ro.cget("state")) == "disabled"
         app._select_tab("devices")
         _gui_pump(root, 0.5)
+        _kbd_mid_sash(root, body)
         q0 = body.sashpos(0)
         _kbd_press(root, ro, "<Control-Shift-Left>")
         assert body.sashpos(0) < q0, "no move from the read-only Inspector"
@@ -110353,7 +113542,7 @@ def gt_kbd_fix_dividers_and_palette_key(app, ctx):
         ro = next((t for t in _walk_class(pt.detail_bottom, tk.Text)
                    if t.winfo_viewable() and str(t.cget("state")) ==
                    "disabled"), None)
-        _kbd_mid_sash(pt.vert_pane)
+        _kbd_mid_sash(root, pt.vert_pane)
         w0 = pt.vert_pane.sashpos(0)
         if ro is not None:
             _kbd_press(root, ro, "<Control-Shift-Down>")
@@ -110471,6 +113660,335 @@ def gt_kbd_fix_palette_recent_privacy(app, ctx):
     finally:
         app.config.set("palette.recent", keep)
         app.config.save()
+
+
+@gui_test_step("sixth audit kbd: Start and Stop keys stay out of text boxes "
+               "and other windows; the Stop key asks first, No keeps "
+               "watching")
+def gt_a6_capture_keys(app, ctx):
+    root = app.root
+    calls, asked = [], []
+    real_ask = messagebox.askyesno
+    answer = [False]
+    app.start = lambda *a, **k: calls.append("start")
+    app.stop = lambda *a, **k: calls.append("stop")
+    sn0 = app.sniffer
+    cfg = app.config
+    had = cfg.get("general.confirm_before_clear", True)
+    messagebox.askyesno = lambda *a, **k: asked.append(a) or answer[0]
+    start = _norm_seq(cfg.get("shortcuts.start") or
+                      DEFAULT_SHORTCUTS["start"])
+    stop = _norm_seq(cfg.get("shortcuts.stop") or DEFAULT_SHORTCUTS["stop"])
+    try:
+        app._select_tab("devices")
+        _gui_pump(root, 0.4)
+        table = app._table_target(app.tabs["devices"])
+        app.sniffer = types.SimpleNamespace(stop=lambda: None)  # watching
+        # typing in the search box: both keys are the box's
+        for seq in (start, stop):
+            _kbd_press(root, app.search_entry, seq)
+        assert calls == [] and asked == [], (calls, asked)
+        # ... and in a text box of another window
+        top = tk.Toplevel(root)
+        try:
+            box = ttk.Entry(top)
+            box.pack()
+            _gui_pump(root, 0.1)
+            for seq in (start, stop):
+                _kbd_press(root, box, seq)
+        finally:
+            top.destroy()
+        assert calls == [] and asked == [], (calls, asked)
+        # on the table: Start starts; Stop asks, and No keeps watching
+        _kbd_press(root, table, start)
+        assert calls == ["start"], calls
+        del calls[:]
+        _kbd_press(root, table, stop)
+        assert len(asked) == 1 and calls == [], (asked, calls)
+        assert "Stop now?" in asked[0][1], asked[0]
+        answer[0] = True
+        _kbd_press(root, table, stop)
+        assert len(asked) == 2 and calls == ["stop"], (asked, calls)
+        # "Ask before clearing data" off: it stops at once
+        del calls[:], asked[:]
+        cfg.set("general.confirm_before_clear", False)
+        _kbd_press(root, table, stop)
+        assert calls == ["stop"] and asked == [], (calls, asked)
+        # nothing running: nothing to ask
+        cfg.set("general.confirm_before_clear", True)
+        app.sniffer = None
+        del calls[:]
+        _kbd_press(root, table, stop)
+        assert calls == ["stop"] and asked == [], (calls, asked)
+    finally:
+        messagebox.askyesno = real_ask
+        app.sniffer = sn0
+        cfg.set("general.confirm_before_clear", had)
+        for n in ("start", "stop"):
+            app.__dict__.pop(n, None)
+        _gui_pump(root, 0.2)
+
+
+_A6_PLAIN = ("Label", "Frame", "TLabel", "TFrame", "Labelframe",
+             "TLabelframe")
+
+
+def _a6_plain_stop(w):
+    """A Label or Frame that Tab lands on and that nothing runs from:
+    no Return or Space of its own (a card, a tab's label, the status
+    line and the Inspector's close mark all have them)."""
+    try:
+        if w.winfo_class() not in _A6_PLAIN:
+            return False
+        return not any(w.bind(s) for s in ("<Return>", "<Key-Return>",
+                                           "<space>", "<Key-space>"))
+    except tk.TclError:
+        return False
+
+
+def _a6_hex(w, colour):
+    r, g, b = (x // 257 for x in w.winfo_rgb(colour))
+    return "#%02x%02x%02x" % (r, g, b)
+
+
+def _a6_ring(w):
+    """Seventh audit (kbd): how a focused Label or Frame shows it has the
+    keyboard: (thickness, ring colour) when a ring can be seen (2 pixels
+    or more, 3:1 against the widget's own background, WCAG 1.4.11),
+    else None. A plain Label or Frame with keys but no ring is an
+    invisible stop all the same."""
+    try:
+        th = int(str(w.cget("highlightthickness")))
+        ring = _a6_hex(w, w.cget("highlightcolor"))
+        bg = _a6_hex(w, w.cget("background"))
+    except (tk.TclError, ValueError):
+        return None
+    if th < 2 or wcag_contrast(ring, bg) < 3:
+        return None
+    return th, ring
+
+
+def _a6_ring_goes(w, focused):
+    """The ring `focused` (from _a6_ring) is gone, or changed so it can
+    be told apart, once the focus has left `w`."""
+    try:
+        th = int(str(w.cget("highlightthickness")))
+        rest = _a6_hex(w, w.cget("highlightbackground"))
+    except (tk.TclError, ValueError):
+        return False
+    return th < focused[0] or wcag_contrast(rest, focused[1]) >= 3
+
+
+def _a6_walk(app, name, bad, seen):
+    """Tab from the search box round the main window once, on tab
+    `name`: every Label or Frame it lands on needs Return or Space and a
+    ring that can be seen, which goes when the focus leaves. -> stops"""
+    root = app.root
+    app.search_entry.focus_force()
+    _gui_pump(root, 0.05)
+    walked, last = 0, None
+    for _ in range(160):
+        w = root.focus_get()
+        if w is None:
+            break
+        w.event_generate("<Tab>")
+        _gui_pump(root, 0.01)
+        f = root.focus_get()
+        if last is not None and last[0] is not f and \
+                not _a6_ring_goes(*last):
+            bad.append((name, "ring stays", str(last[0])[-50:]))
+        last = None
+        if f is None or f is app.search_entry:
+            break
+        walked += 1
+        txt = ""
+        with contextlib.suppress(tk.TclError):
+            txt = str(f.cget("text"))[:30]
+        if _a6_plain_stop(f):
+            bad.append((name, f.winfo_class(), str(f)[-50:], txt))
+        elif f.winfo_class() in _A6_PLAIN:
+            ring = _a6_ring(f)
+            if ring is None:
+                bad.append((name, "no ring", f.winfo_class(),
+                            str(f)[-50:], txt))
+            else:
+                seen.add(str(f))
+                last = (f, ring)
+    return walked
+
+
+@gui_test_step("sixth audit kbd: Tab through the main window, every tab, "
+               "lands only on things you can use (never a plain Label or "
+               "Frame)")
+def gt_a6_tab_stops_usable(app, ctx):
+    """Seventh audit (kbd): still "a bare Label and two Frames" from the
+    search box on the Dashboard: the tab strip's label and the first two
+    answer cards. Each runs something from Return and Space and draws a
+    2-pixel ring (checked here, in both themes and both modes), and an
+    answer card with nothing to show is no longer a stop."""
+    root = app.root
+    mode = app.mode_ui_var.get()
+    theme0, hc0 = app.theme_name, app.high_contrast
+    dash = app.tabs["dash"]
+    bad, seen, walked = [], set(), 0
+    try:
+        for ui, theme in (("Advanced", "Light"), ("Beginner", "Dark")):
+            app.mode_ui_var.set(ui)
+            app._on_ui_mode_change()
+            app._apply_theme(theme, False)
+            _gui_pump(root, 0.4)
+            for name in list(app.tabs):
+                app._select_tab(name)
+                _gui_pump(root, 0.35)
+                walked += _a6_walk(app, f"{ui}/{theme}/{name}", bad, seen)
+        assert walked > 80, walked
+        assert not bad, bad[:10]
+        # the auditor's three stops were among those checked
+        strip = app.tabstrip.tabs[str(dash.frame)][2]
+        cards = [dash.answer_cards[k][0] for k, _q in dash.ANSWERS[:2]]
+        missed = [str(w) for w in [strip] + cards if str(w) not in seen]
+        assert not missed, ("not reached by Tab", missed)
+        # Return on an answer card runs its "Show me"
+        app._select_tab("dash")
+        _gui_pump(root, 0.3)
+        shown = []
+        # (round 8) the Dashboard's own refresh puts its answers back in
+        # answer_show every few seconds, so the spy sits on what the
+        # card's Return calls instead
+        dash._answer_show = shown.append
+        try:
+            for i, (key, card) in enumerate(zip(("wrong", "usage"),
+                                                cards)):
+                card.focus_force()
+                # (CI) Tk gives a key to the window with the focus: wait
+                # until the card has it
+                _gui_pump(root, 0.05, until=lambda c=card:
+                          root.focus_get() is c, timeout=3)
+                if root.focus_get() is not card and i:
+                    # (Windows CI) a card further down the Dashboard did
+                    # not take the focus that way: Tab there, as a person
+                    # would, from the card before it (round 8, Ubuntu CI:
+                    # from whatever had the focus, Tab went elsewhere)
+                    cards[i - 1].focus_force()
+                    _gui_pump(root, 0.05, until=lambda c=cards[i - 1]:
+                              root.focus_get() is c, timeout=3)
+                    cards[i - 1].event_generate("<Tab>")
+                    _gui_pump(root, 0.05, until=lambda c=card:
+                              root.focus_get() is c, timeout=3)
+                assert root.focus_get() is card, (
+                    key, root.focus_get(), card.winfo_viewable())
+                card.event_generate("<Return>")
+                _gui_pump(root, 0.05)
+        finally:
+            del dash._answer_show
+        assert shown == ["wrong", "usage"], shown
+        # an answer with nothing to show ("Can't tell yet …") is not a
+        # stop and has no "Show me ›"; it is again once it has one
+        app.answer_wrong = lambda: ("Can't tell yet.", "muted", None)
+        try:
+            app._answers = None
+            dash._refresh_answers()
+            _gui_pump(root, 0.2)
+            card, more = dash.answer_cards["wrong"]
+            assert str(card.cget("takefocus")) == "0" and \
+                not more.winfo_manager(), (card.cget("takefocus"),
+                                           more.winfo_manager())
+            seen.clear()
+            _a6_walk(app, "dash, nothing to show", bad, seen)
+            assert str(card) not in seen and not bad, (bad, str(card))
+            assert str(cards[1]) in seen, sorted(seen)
+        finally:
+            del app.answer_wrong
+            app._answers = None
+            dash._refresh_answers()
+            _gui_pump(root, 0.2)
+        assert str(card.cget("takefocus")) == "1" and \
+            more.winfo_manager(), card.cget("takefocus")
+    finally:
+        app.mode_ui_var.set(mode)
+        app._on_ui_mode_change()
+        app._apply_theme(theme0, hc0)
+        _gui_pump(root, 0.3)
+
+
+@gui_test_step("sixth audit UI: Alerts at 1024 wide in French and Spanish, "
+               "Normal and Extra large: every heading shows, nothing is "
+               "pushed off the table")
+def gt_a6_alerts_1024(app, ctx):
+    root = app.root
+    tab = app._select_tab("alerts")
+    texts = tab.severity_texts()
+    real = tab.table_wrap
+    pack0 = {k: v for k, v in real.pack_info().items() if k != "in"}
+    geo0, max0 = root.geometry(), root.maxsize()
+    root.maxsize(px(4000), px(3000))     # a 1024-px screen: truly 1024
+    # (5.3.4) at 690 high, Extra large and French the header, tool bar
+    # and three rows of tabs left the table 0-120 px (font-dependent),
+    # too little for Tk to lay its columns out; the tab now gives way
+    # above its table in a short window
+    root.geometry(px_geo("1024x690"))
+    _gui_pump(root, 0.5)
+    try:
+        for lang in ("Français", "Español"):
+            app.config.set("general.language", lang)
+            app._apply_runtime_settings()
+            for size in ("Normal", "Extra large"):
+                app.config.set("appearance.text_size", size)
+                app._apply_text_size(defer=False)
+                _gui_pump(root, 0.3)
+                app.finish_text_size()
+                tab.rebuild()
+                _gui_pump(root, 0.4)
+                # the table as at a start in a narrow window: built with
+                # its own widths and first laid out at 1024 wide (Tk then
+                # leaves "What happened" at 440 pixels; it squeezes only
+                # a table that changes size)
+                spec = [(c, translate_text(h), w, a, st)
+                        for c, h, w, a, st in tab.COLUMNS]
+                wrap, t2 = make_tree(tab.frame, spec, selectmode="extended")
+                try:
+                    fit_cell_texts(t2, "sev", texts)
+                    fit_tree_headings(t2)
+                    wrap.pack(before=real, fill="both", expand=True,
+                              padx=6, pady=(0, 6))
+                    real.pack_forget()
+                    _gui_pump(root, 0.6)
+                    avail = t2.winfo_width()
+                    ws = {c: int(t2.column(c, "width"))
+                          for c in t2["columns"]}
+                    found = [x for x in layout_audit(root, cells=True)
+                             if x[1] == str(t2) and
+                             x[0] in ("heading-cut", "column-cut")]
+                    assert avail > 100 and not found and \
+                        sum(ws.values()) <= avail + 4, (
+                            lang, size, avail, ws, found)
+                    font = tree_cell_font()
+                    cut = [t for t in texts
+                           if font.measure(t) + 12 > ws.get("sev", 0)]
+                    assert not cut, (lang, size, ws, cut)
+                    # (5.3.4) room for at least 3 rows, counted with the
+                    # tree's own row height (the first row's box)
+                    for _i in range(4):
+                        t2.insert("", "end", values=("·",) * len(spec))
+                    _gui_pump(root, 0.2)
+                    box = t2.bbox(t2.get_children()[0])
+                    rows = (t2.winfo_height() - int(box[1])) // \
+                        max(1, int(box[3])) if box else 0
+                    assert rows >= 3, (lang, size, rows, box,
+                                       t2.winfo_height(),
+                                       root.winfo_height())
+                finally:
+                    real.pack(before=wrap, **pack0)
+                    wrap.destroy()
+                    _gui_pump(root, 0.2)
+    finally:
+        app.config.set("general.language", "English")
+        app._apply_runtime_settings()
+        app.config.set("appearance.text_size", "Normal")
+        app._apply_text_size(defer=False)
+        root.maxsize(*max0)
+        root.geometry(geo0)
+        _gui_pump(root, 0.4)
 
 
 

@@ -64,7 +64,7 @@ Everything it writes goes in one data folder (see [Installation](INSTALL.md#wher
 - With history off, no record of what you watched is kept after you close the window: no history and no saved session. While you watch, a crash-safe copy of the session is kept and is deleted when you close. Only after a crash does it stay, so the next start can offer it back.
 - With history on, the last session is also saved when you close (**Open last autosave**), unless history is set to *Session only*.
 - Your device names and notes, the networks you marked as yours and the list of programs on this computer that wait for connections are kept either way.
-- **Clear history** in **Settings → History**, answered with *Yes* (delete ALL), deletes all of it: the history, saved packets, the autosave, crash copies, your device names and notes, the remembered networks and the list of programs that wait for connections.
+- **Clear history** in **Settings → History**, answered with *Yes* (delete ALL), deletes all of it: the history, saved packets, the autosave, crash copies, your device names and notes, the remembered networks, the list of programs that wait for connections, and the settings that name what was seen (recent filters, places on the Map, website categories you chose, alert rules for one device or address).
 - Passwords, mail logins and message bodies are dropped inside the decoders and never stored. A canary self-test plants fake secrets and checks every report, session, CSV, log, history row and clipboard copy for them.
 - On Linux and macOS the data folder is closed to other users.
 - **Storage used…** in the command palette (`Ctrl+K`) shows what each part takes. Deleting the folder removes everything, except passwords for connected helpers that you saved in the system keychain on macOS or Linux (see [Uninstalling](INSTALL.md#uninstalling)).
@@ -79,8 +79,8 @@ You can always say no. It then opens in limited mode, where you can still use ca
 
 ## 5. Check how it is tested
 
-- **Self-test:** 480 tests built into the file (`--self-test`). They cover the decoders, the alert rules, the privacy canary, the outbound gate, corrupt files and clock jumps. Without scapy and psutil, 40 of them are skipped; the [README](../README.md#testing) lists what each setup gives.
-- **GUI test:** `--gui-test` drives the real window through every tab, in 95 steps (the live-capture step runs only with `--live`).
+- **Self-test:** 520 tests built into the file (`--self-test`). They cover the decoders, the alert rules, the privacy canary, the outbound gate, corrupt files and clock jumps. Without scapy and psutil, 40 of them are skipped; the [README](../README.md#testing) lists what each setup gives.
+- **GUI test:** `--gui-test` drives the real window through every tab, in 126 steps. On Linux 125 pass and 1 is skipped (live capture, which runs only with `--live`); on Windows 123 pass and 3 are skipped (live capture, and two steps that need Linux: the 500-round soak reads /proc and the font check needs X11).
 - **CI:** every push and pull request runs the self-test on Python 3.8, 3.12 and 3.13, the GUI test on two Ubuntu versions, the self-test and GUI test on Windows, the self-test on macOS, and a [privacy check](../.github/scripts/privacy_check.py) that keeps captures, personal data and keys out of this public repository. Results are on the [Actions page](https://github.com/darkckillerc4/MiniWireshark/actions).
 - **Long runs:** a fast replay test tracks memory, threads and Tk interpreters over many simulated hours. 5.3.4 was not re-run for 8 hours on a real PC; the [changelog](../CHANGELOG.md) lists that under Known limits.
 - **Screenshots** in these docs are taken from Demo Mode: simulated data with reserved `example.com`, `.org` and `.net` names. Nothing in them is real traffic.

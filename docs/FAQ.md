@@ -96,5 +96,14 @@ Open an [issue](https://github.com/darkckillerc4/MiniWireshark/issues/new/choose
 **Where are the older versions?**
 On the [releases page](https://github.com/darkckillerc4/MiniWireshark/releases). Each release has the `.py` file and a `.sha256` file. The [version index](VERSIONS.md) lists the checksum of every release.
 
+**Why do new versions take so long now?**
+Because a version is not published until it has passed more checks than before. In practice that means:
+- More automated tests: the self-test and the GUI test grew with each version, and a release waits for all of them.
+- Several systems: continuous integration runs them on Linux, Windows and macOS, on more than one Python version, and a failure on any one of them holds the version back.
+- Repeated audits: the code went through several security and interface audits, and each round's findings were fixed and given a test before the next round.
+- Honest limits: a few things can only be checked on a real PC (a long capture on Windows, a VPN, a real Wi-Fi roam). They are listed under *Known limits* in the [changelog](../CHANGELOG.md) instead of being claimed.
+
+The price is slower releases; the aim is that a version you download has been tested and says what it has not been tested for. A version still in testing is said to be so in the [README](../README.md), and a release is published only when it is merged to the main branch.
+
 **Can two versions share a folder?**
 Yes. Copies in the same folder share `miniwireshark_data/` next to the script. To keep them fully apart, put each in its own folder. From 5.2.3, copies sharing a folder can no longer damage each other's files.

@@ -2,7 +2,8 @@ name: Release
 
 # Publishes the version on main as soon as it is finished. A version is
 # finished when SCRIPT_VERSION in miniwireshark.py has its own
-# "## [x.y.z] — date" section in CHANGELOG.md (not "[Unreleased]").
+# "## [x.y.z]" section in CHANGELOG.md (not "[Unreleased]"). A heading
+# without a date gets the release's date in the commit below.
 # The job then creates the tag and the GitHub release with the .py file
 # and a .sha256 file, and commits the new row to docs/VERSIONS.md, the
 # README and .github/archive-releases.json. If the release exists already,

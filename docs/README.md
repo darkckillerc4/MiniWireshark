@@ -15,6 +15,7 @@ MiniWireshark is a single-file network monitor that explains your network in pla
 | [Architecture](ARCHITECTURE.md) | Understand how the one file is organised and how a packet becomes an answer |
 | [Alerts reference](ALERTS.md) | Look up an alert: why it fired, what it usually means and what to check |
 | [Packet filter fields](FIELDS.md) | Write a field filter: every protocol and field the Packets tab knows |
+| [Keyboard only](KEYBOARD.md) | Use everything without a mouse, and what is tested |
 | [Glossary](GLOSSARY.md) | Look up a word: network terms and MiniWireshark features in plain English |
 | [FAQ and troubleshooting](FAQ.md) | Fix a problem, or check what MiniWireshark does with your data |
 | [Logo and images](BRANDING.md) | Use the logo, icons, Windows icon or social preview |
