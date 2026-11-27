@@ -304,7 +304,7 @@ A medium release that makes MiniWireshark safer, easier to start and easier to u
 
 - Device fingerprints from DHCP request lists ship without built-in rows until real captures of your own devices are available.
 
-Tested on Python 3.8, 3.12 and 3.13, and 3.12 and 3.14 on Windows (520 self-tests), and with 126 GUI steps on Ubuntu 22.04 and 24.04 and on Windows. On Linux 125 pass and 1 is skipped (live capture, which runs only with `--live`); on Windows 123 pass and 3 are skipped (live capture, and two steps that need Linux: the 500-round soak reads /proc and the font check needs X11). A test that can't run on a machine (for example one that needs Windows) is reported as skipped, not passed. On Linux with Python 3.12, scapy and psutil we measured 518 passed, 0 failed, 2 skipped (run as root, no `ip` or `arp`); without scapy and psutil, 40 more tests are skipped (478 / 0 / 42). The [README](README.md#testing) lists every setup we measured.
+Tested on Python 3.8, 3.12 and 3.13, and 3.12 and 3.14 on Windows (521 self-tests), and with 127 GUI steps on Ubuntu 22.04 and 24.04 and on Windows. On Linux 126 pass and 1 is skipped (live capture, which runs only with `--live`); on Windows 124 pass and 3 are skipped (live capture, and two steps that need Linux: the 500-round soak reads /proc and the font check needs X11). A test that can't run on a machine (for example one that needs Windows) is reported as skipped, not passed. On Linux with Python 3.12, scapy and psutil we measured 519 passed, 0 failed, 2 skipped (run as root, no `ip` or `arp`); without scapy and psutil, 40 more tests are skipped (479 / 0 / 42). The [README](README.md#testing) lists every setup we measured.
 
 ## [5.2.3] — 2026-10-24
 
