@@ -89857,17 +89857,31 @@ def t_warm_up_on_the_loading_screen(ctx):
     real_listen = conf.L2listen
     try:
         conf.L2listen = lambda **kw: QuietSock()
-        t0 = time.perf_counter()
-        src, err = start_capture_source("lo", None, False, lambda *a: None)
-        took = time.perf_counter() - t0
-        assert src is not None and err is None
-        # (round 8, macOS CI once: 0.169 s) the failure says where the time
-        # went: to the capture thread's first wait, in the 20 ms wait, or
-        # after it, and how many other threads were running
-        assert took < 0.15, (round(took, 3), {
-            k: round(v - t0, 3) for k, v in marks.items()},
-            threading.active_count())
-        src.stop()
+        # Round 8 (macOS CI missed the 0.15 s once, at 0.169 s; the whole
+        # test took 138-318 ms over 14 macOS runs; here the start takes
+        # about 20.7 ms: 0.3 ms to the first wait, the 20 ms wait, then it
+        # returns). The fake socket opens at once, so what was left was the
+        # runner's scheduling. The limit is judged on the best of 3 starts:
+        # a fixed 0.2 s sleep makes every start at least 0.2 s, so it
+        # still fails. And the start must return within 50 ms after the
+        # first quiet wait ended, which a smaller extra wait (0.1 s, under
+        # the old 0.15 s limit) fails too.
+        runs = []
+        for _i in range(3):
+            marks.clear()
+            t0 = time.perf_counter()
+            src, err = start_capture_source("lo", None, False,
+                                            lambda *a: None)
+            t1 = time.perf_counter()
+            assert src is not None and err is None
+            assert src.first_cycle.is_set() and "quiet" in marks, marks
+            runs.append((round(t1 - t0, 4), round(t1 - marks["quiet"], 4),
+                         {k: round(v - t0, 4) for k, v in marks.items()},
+                         threading.active_count()))
+            src.stop()
+        took, after = min(runs, key=lambda r: r[0])[:2]
+        assert took < 0.15 and after < 0.05, (
+            "start (s), after the quiet wait (s), marks, threads", runs)
         rc = RawCapture("lo", None, False, lambda *a: None)
         conf.L2listen = lambda **kw: BadSock()
         rc.start()
