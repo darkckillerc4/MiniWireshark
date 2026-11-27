@@ -89832,12 +89832,16 @@ def t_warm_up_on_the_loading_screen(ctx):
     if not ctx.scapy_ok or conf is None:
         return "skip"   # (35-checker review) was counted as passed
 
+    marks = {}
+
     class QuietSock:
         closed = False
 
         @staticmethod
         def select(socks, timeout):
+            marks.setdefault("select", time.perf_counter())
             time.sleep(min(timeout, 0.02))
+            marks.setdefault("quiet", time.perf_counter())
             return []
 
         def recv_raw(self, n):
@@ -89857,7 +89861,12 @@ def t_warm_up_on_the_loading_screen(ctx):
         src, err = start_capture_source("lo", None, False, lambda *a: None)
         took = time.perf_counter() - t0
         assert src is not None and err is None
-        assert took < 0.15, took
+        # (round 8, macOS CI once: 0.169 s) the failure says where the time
+        # went: to the capture thread's first wait, in the 20 ms wait, or
+        # after it, and how many other threads were running
+        assert took < 0.15, (round(took, 3), {
+            k: round(v - t0, 3) for k, v in marks.items()},
+            threading.active_count())
         src.stop()
         rc = RawCapture("lo", None, False, lambda *a: None)
         conf.L2listen = lambda **kw: BadSock()
