@@ -11,6 +11,7 @@
     {"tag": "v5.0.2", "title": "MiniWireshark 5.0.2", "target": "49471fe", "source": "49471fe:miniwireshark.py", "asset": "miniwireshark-5.0.2.py", "sha256": "77c1909a1451db4d1a60fd5a520a09be5df182ed8f4314cedcc85f7746bb6f67", "prerelease": false},
     {"tag": "v5.1.2-rc.5", "title": "MiniWireshark 5.1.2 release candidate 5", "target": "759be4b", "source": "759be4b:miniwireshark.py", "asset": "miniwireshark-5.1.2-rc.5.py", "sha256": "6ac76e5e6655b66205cccba6100bfe1f23ba899b3e35e92797a0f0df23c11ff7", "prerelease": true},
     {"tag": "v5.1.2", "title": "MiniWireshark 5.1.2", "target": "304948d", "source": "304948d:miniwireshark.py", "asset": "miniwireshark-5.1.2.py", "sha256": "2adadab93ce4f86938cd45e82be2f824163090fc660732b21ce8048efe327534", "prerelease": false},
-    {"tag": "v5.2.3", "title": "MiniWireshark 5.2.3", "target": "d0832b8", "source": "d0832b8:miniwireshark.py", "asset": "miniwireshark-5.2.3.py", "sha256": "41bc3a1a0f0248c25d6dd98525940c9d5a2d3e39673ab81d92ec4aadacb9c388", "prerelease": false, "latest": true}
+    {"tag": "v5.2.3", "title": "MiniWireshark 5.2.3", "target": "d0832b8", "source": "d0832b8:miniwireshark.py", "asset": "miniwireshark-5.2.3.py", "sha256": "41bc3a1a0f0248c25d6dd98525940c9d5a2d3e39673ab81d92ec4aadacb9c388", "prerelease": false},
+    {"tag": "v5.3.4", "title": "MiniWireshark 5.3.4", "target": "0732dd4", "source": "0732dd4:miniwireshark.py", "asset": "miniwireshark-5.3.4.py", "sha256": "13c5bcc61af848888963647f9c833228f7f40df2385eb8904785dbd85a728fd2", "prerelease": false, "latest": true}
   ]
 }
